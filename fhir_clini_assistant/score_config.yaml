@@ -1,0 +1,67 @@
+# Tablas de score de riesgo (editable por clínicos)
+# Cada sección define un parámetro y sus umbrales/categorías.
+
+imc:
+  # Regla: se evalúa por rangos en kg/m2, inclusivo de límites inferiores
+  # Orden de evaluación: top-down
+  ranges:
+    - { min: 40.0, score: 3, label: ">=40" }
+    - { min: 30.0, max: 39.9, score: 2, label: "30-39.9" }
+    - { min: 25.0, max: 29.9, score: 1, label: "25-29.9" }
+    - { max: 24.9, score: 0, label: "<25" }
+
+cintura_cm:
+  female:
+    ranges:
+      - { min: 88.1, score: 2, label: ">88" }
+      - { min: 80.0, max: 88.0, score: 1, label: "80-88" }
+      - { max: 79.9, score: 0, label: "<80" }
+  male:
+    ranges:
+      - { min: 102.1, score: 2, label: ">102" }
+      - { min: 94.0, max: 102.0, score: 1, label: "94-102" }
+      - { max: 93.9, score: 0, label: "<94" }
+
+fumar:
+  # Map simple de estados a score
+  none: 0
+  current: 3 
+
+edad:
+  ranges:
+    - { min: 65.0, score: 4, label: ">64" }
+    - { min: 60.0, max: 64.9, score: 3, label: "60-64" }
+    - { min: 50.0, max: 59.9, score: 2, label: "50-59" }
+    - { min: 40.0, max: 49.9, score: 1, label: "40-49" }
+    - { max: 39.9, score: 0, label: "<40" } 
+
+analitos:
+  fpg_mg_dl:
+    # fasting plasma glucose (mg/dL)
+    normal_max: 99.9       # <100 => 0 si HbA1c <5.7
+    prediabetes_min: 100.0 # 100-125 => 3
+    prediabetes_max: 125.0
+    diabetes_min: 126.0    # >=126 => 5
+  hba1c_pct:
+    normal_max: 5.69       # <5.7 => 0 si FPG <100
+    prediabetes_min: 5.7   # 5.7-6.4 => 3
+    prediabetes_max: 6.4
+    diabetes_min: 6.5      # >=6.5 => 5 
+
+trigliceridos_mg_dl:
+  ranges:
+    - { min: 500.0, score: 3, label: ">=500" }
+    - { min: 150.0, max: 499.9, score: 2, label: "150-499" }
+    - { max: 149.9, score: 0, label: "<150" } 
+
+hdl_mg_dl:
+  male:
+    ranges:
+      - { min: 60.0, score: 0, label: ">=60" }
+      - { min: 40.0, max: 59.9, score: 1, label: "40-59" }
+      - { max: 39.9, score: 2, label: "<40" }
+  female:
+    ranges:
+      - { min: 60.0, score: 0, label: ">=60" }
+      - { min: 50.0, max: 59.9, score: 1, label: "50-59" }
+      - { max: 49.9, score: 2, label: "<50" } 

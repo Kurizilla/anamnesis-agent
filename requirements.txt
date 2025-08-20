@@ -1,0 +1,6 @@
+fastapi
+google-adk==1.7.0
+uvicorn[standard]
+httpx
+google-auth
+google-auth-oauthlib 

@@ -1,0 +1,39 @@
+services:
+  clini_api:
+    build: .
+    image: clini-assistant:local
+    environment:
+      - LOGLEVEL=DEBUG
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - GOOGLE_GENAI_USE_VERTEXAI=${GOOGLE_GENAI_USE_VERTEXAI}
+      - GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT}
+      - GOOGLE_CLOUD_LOCATION=${GOOGLE_CLOUD_LOCATION}
+      - FHIR_PROJECT=${FHIR_PROJECT}
+      - FHIR_LOCATION=${FHIR_LOCATION}
+      - FHIR_DATASET=${FHIR_DATASET}
+      - FHIR_STORE=${FHIR_STORE}
+      - FHIR_API_BEARER=${FHIR_API_BEARER}
+      - GOOGLE_APPLICATION_CREDENTIALS=/secrets/adc.json
+      - AGENTS_DIR=/app
+      - AGENT_NAME=fhir_clini_assistant
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./secrets:/secrets:ro
+      - ./fhir_clini_assistant:/app/fhir_clini_assistant:ro
+      - ./app:/app/app:ro
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.ui
+    image: clini-assistant-ui:local
+    environment:
+      - BACKEND_URL=http://clini_api:8000
+    ports:
+      - "${UI_PORT:-8501}:8501"
+    depends_on:
+      - clini_api
+    volumes:
+      - ./app:/ui/app:ro 

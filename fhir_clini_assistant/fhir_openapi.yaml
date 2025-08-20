@@ -1,0 +1,515 @@
+openapi: "3.0.0"
+info:
+  title: "FHIR Clinical API"
+  version: "1.0"
+
+servers:
+  - url: "https://fhir-agent-api-485348972581.us-central1.run.app"
+
+tags:
+  - name: "Condiciones Clínicas"
+    description: "Obtiene las condiciones clínicas activas de un paciente desde el recurso FHIR Condition."
+  - name: "Variables de Prevención"
+    description: "Obtiene las variables de prevención de un paciente a partir de QuestionnaireResponse."
+  - name: "Medicamentos"
+    description: "Obtiene las recetas de medicamentos de un paciente a partir del recurso MedicationRequest."
+  - name: "Antecedentes Patológicos Personales"
+    description: "Obtiene los antecedentes patológicos personales del paciente desde FHIR."
+  - name: "Determinantes Socioambientales"
+    description: "Obtiene los determinantes socioambientales de un paciente a partir de QuestionnaireResponse."
+  - name: "Antecedentes Familiares"
+    description: "Obtiene antecedentes familiares completados de un paciente desde el recurso FamilyMemberHistory."
+  - name: "Resumen del Paciente"
+    description: "Consulta la disponibilidad de recursos clínicos de un paciente en FHIR."
+  - name: "Alergias"
+    description: "Obtiene alergias activas y confirmadas registradas en el recurso AllergyIntolerance."
+  - name: "Patient"
+    description: "Obtiene información de un paciente a partir de su ID."
+  - name: "Observaciones"
+    description: "Obtiene resultados clínicos u observaciones de laboratorio del paciente desde el recurso Observation."
+
+paths:
+  /condiciones:
+    get:
+      summary: "Obtener condiciones clínicas registradas del paciente"
+      operationId: "getConditions"
+      tags:
+        - "Condiciones Clínicas"
+      parameters:
+        - name: "patient"
+          in: "query"
+          required: true
+          schema:
+            type: "string"
+            example: "Patient/2b5f9fa7-d4a3-4520-8ed7-c382ec2950bc"
+      responses:
+        "200":
+          description: "Condiciones clínicas obtenidas exitosamente"
+          content:
+            application/json:
+              schema:
+                type: "array"
+                items:
+                  type: "object"
+                  properties:
+                    condicion:
+                      type: "string"
+                      description: "Nombre de la condición"
+                    codigo:
+                      type: "string"
+                      description: "Código de la condición"
+                    fecha_registro:
+                      type: "string"
+                      format: "date-time"
+                    estado:
+                      type: "string"
+                      description: "Estado de verificación"
+        "404":
+          description: "No se encontraron condiciones clínicas registradas"
+
+  /prevention:
+    get:
+      summary: "Obtener variables de prevención procesadas de un paciente"
+      operationId: "getPreventionVariables"
+      tags:
+        - "Variables de Prevención"
+      parameters:
+        - name: "patient"
+          in: "query"
+          required: true
+          schema:
+            type: "string"
+            example: "Patient/2b5f9fa7-d4a3-4520-8ed7-c382ec2950bc"
+      responses:
+        "200":
+          description: "Variables de prevención obtenidas exitosamente"
+          content:
+            application/json:
+              schema:
+                type: "array"
+                items:
+                  type: "object"
+                  properties:
+                    fecha:
+                      type: "string"
+                      format: "date-time"
+                    estado:
+                      type: "string"
+                    doctor_id:
+                      type: "string"
+                      description: "ID del doctor que realizó el cuestionario"
+                    paciente_id:
+                      type: "string"
+                      description: "ID del paciente asociado al cuestionario"
+                    preguntas:
+                      type: "array"
+                      items:
+                        type: "object"
+                        properties:
+                          pregunta:
+                            type: "string"
+                          respuestas:
+                            type: "array"
+                            items:
+                              type: "string"
+        "404":
+          description: "No se encontraron variables de prevención"
+
+  /medicamentos:
+    get:
+      summary: "Obtener recetas de medicamentos de un paciente"
+      operationId: "getMedicationRequests"
+      tags:
+        - "Medicamentos"
+      parameters:
+        - name: "patient"
+          in: "query"
+          required: true
+          schema:
+            type: "string"
+            example: "Patient/2b5f9fa7-d4a3-4520-8ed7-c382ec2950bc"
+      responses:
+        "200":
+          description: "Recetas de medicamentos obtenidas exitosamente"
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    medicamento:
+                      type: string
+                      example: "HIOSCINA N-BUTIL BROMURO 10MG /TABLETA"
+                    estado:
+                      type: string
+                      example: "stopped"
+                    intencion:
+                      type: string
+                      example: "order"
+                    instrucciones:
+                      type: array
+                      items:
+                        type: string
+                      example: ["Tomar 1.0 tableta(s) cada 12 hora(s) por 5 día(s)"]
+                    razones:
+                      type: array
+                      items:
+                        type: string
+                      example: ["Diarrea", "Tifus, sin especificación"]
+                    paciente_id:
+                      type: string
+                      example: "2b5f9fa7-d4a3-4520-8ed7-c382ec2950bc"
+        "404":
+          description: "No se encontraron recetas de medicamentos"
+
+  /patologicos-personales:
+    get:
+      summary: "Obtener antecedentes patológicos personales del paciente"
+      operationId: "getPatologicosPersonales"
+      tags:
+        - "Antecedentes Patológicos Personales"
+      parameters:
+        - name: "patient"
+          in: "query"
+          required: true
+          schema:
+            type: "string"
+            example: "Patient/2b5f9fa7-d4a3-4520-8ed7-c382ec2950bc"
+      responses:
+        "200":
+          description: "Antecedentes patológicos personales obtenidos exitosamente"
+          content:
+            application/json:
+              schema:
+                type: "array"
+                items:
+                  type: "object"
+                  properties:
+                    fecha:
+                      type: "string"
+                      format: "date-time"
+                    estado:
+                      type: "string"
+                    doctor_id:
+                      type: "string"
+                      description: "ID del doctor que realizó el cuestionario"
+                    paciente_id:
+                      type: "string"
+                      description: "ID del paciente asociado al cuestionario"
+                    preguntas:
+                      type: "array"
+                      items:
+                        type: "object"
+                        properties:
+                          pregunta:
+                            type: "string"
+                          respuestas:
+                            type: "array"
+                            items:
+                              type: "string"
+        "404":
+          description: "No se encontraron antecedentes patológicos personales"
+
+  /determinants:
+    get:
+      summary: "Obtener determinantes socioambientales procesados de un paciente"
+      operationId: "getSocioenvironmentalDeterminants"
+      tags:
+        - "Determinantes Socioambientales"
+      parameters:
+        - name: "patient"
+          in: "query"
+          required: true
+          schema:
+            type: "string"
+            example: "Patient/c6c6a2c4-844c-4818-8906-016cd6616824"
+      responses:
+        "200":
+          description: "Determinantes socioambientales obtenidos exitosamente"
+          content:
+            application/json:
+              schema:
+                type: "array"
+                items:
+                  type: "object"
+                  properties:
+                    fecha:
+                      type: "string"
+                      format: "date-time"
+                    estado:
+                      type: "string"
+                    doctor_id:
+                      type: "string"
+                      description: "ID del doctor que realizó el cuestionario"
+                    paciente_id:
+                      type: "string"
+                      description: "ID del paciente asociado al cuestionario"
+                    preguntas:
+                      type: "array"
+                      items:
+                        type: "object"
+                        properties:
+                          pregunta:
+                            type: "string"
+                          respuestas:
+                            type: "array"
+                            items:
+                              type: "string"
+        "404":
+          description: "No se encontraron determinantes socioambientales"
+
+  /antecedentes_familiares:
+    get:
+      summary: "Obtener antecedentes familiares completados del paciente"
+      operationId: "getAntecedentesFamiliares"
+      tags:
+        - "Antecedentes Familiares"
+      parameters:
+        - name: "patient"
+          in: "query"
+          required: true
+          schema:
+            type: "string"
+            example: "Patient/2b5f9fa7-d4a3-4520-8ed7-c382ec2950bc"
+      responses:
+        "200":
+          description: "Antecedentes familiares encontrados"
+          content:
+            application/json:
+              schema:
+                type: "array"
+                items:
+                  type: "object"
+                  properties:
+                    paciente_id:
+                      type: "string"
+                    relacion:
+                      type: "string"
+                    condicion:
+                      type: "string"
+                    codigo:
+                      type: "string"
+                    contribuyo_a_la_muerte:
+                      type: "boolean"
+        "404":
+          description: "No se encontraron antecedentes familiares"
+
+  /disponibilidad_recursos:
+    get:
+      summary: "Obtener recursos clínicos disponibles del paciente"
+      operationId: "getDisponibilidadRecursos"
+      tags:
+        - "Resumen del Paciente"
+      parameters:
+        - name: "patient_id"
+          in: "query"
+          required: true
+          schema:
+            type: "string"
+            example: "39645b57-bf0b-4ddd-ac2a-96914a4459c8"
+      responses:
+        "200":
+          description: "Recursos clínicos encontrados"
+          content:
+            application/json:
+              schema:
+                type: "object"
+                properties:
+                  patient_id:
+                    type: "string"
+                  nombre:
+                    type: "string"
+                  genero:
+                    type: "string"
+                  edad:
+                    type: "string"
+                  recursos_disponibles:
+                    type: "object"
+                    properties:
+                      condiciones:
+                        type: "array"
+                        items:
+                          type: "string"
+                      observaciones:
+                        type: "array"
+                        items:
+                          type: "string"
+                      alergias:
+                        type: "array"
+                        items:
+                          type: "object"
+                          properties:
+                            alergia_a:
+                              type: "string"
+                            estado:
+                              type: "string"
+                            verificacion:
+                              type: "string"
+                      antecedentes_familiares:
+                        type: "array"
+                        items:
+                          type: "string"
+                      medicamentos:
+                        type: "array"
+                        items:
+                          type: "string"
+        "404":
+          description: "No se encontró el paciente o los recursos solicitados"
+
+  /alergias:
+    get:
+      summary: "Obtener alergias confirmadas del paciente"
+      operationId: "getAlergias"
+      tags:
+        - "Alergias"
+      parameters:
+        - name: "patient"
+          in: "query"
+          required: true
+          schema:
+            type: "string"
+            example: "Patient/456"
+      responses:
+        "200":
+          description: "Alergias encontradas"
+          content:
+            application/json:
+              schema:
+                type: "array"
+                items:
+                  type: "object"
+                  properties:
+                    alergia_a:
+                      type: "string"
+                    codigo:
+                      type: "string"
+                    categoria:
+                      type: "array"
+                      items:
+                        type: "string"
+                    descripcion_reaccion:
+                      type: "string"
+                    manifestacion:
+                      type: "string"
+                    severidad:
+                      type: "string"
+                    criticalidad:
+                      type: "string"
+                    fecha_registro:
+                      type: "string"
+                      format: "date-time"
+                    paciente_id:
+                      type: "string"
+        "404":
+          description: "No se encontraron alergias registradas"
+
+  /patient:
+    get:
+      summary: "Obtener información de un paciente por ID"
+      operationId: "getPatientById"
+      tags:
+        - "Patient"
+      parameters:
+        - name: "patient_id"
+          in: "query"
+          required: true
+          schema:
+            type: "string"
+            example: "8880f144-7369-473f-bd0b-35ee73b5f9ea"
+      responses:
+        "200":
+          description: "Información del paciente obtenida exitosamente"
+          content:
+            application/json:
+              schema:
+                type: "object"
+                properties:
+                  nombre:
+                    type: "string"
+                  contacto:
+                    type: "array"
+                    items:
+                      type: "object"
+                      properties:
+                        value:
+                          type: "string"
+                        system:
+                          type: "string"
+                  documentos:
+                    type: "array"
+                    items:
+                      type: "object"
+                      properties:
+                        value:
+                          type: "string"
+                        display:
+                          type: "string"
+                  genero:
+                    type: "string"
+                  fecha_de_nacimiento:
+                    type: "string"
+                    format: "date"
+                  direccion:
+                    type: "object"
+                    properties:
+                      city:
+                        type: "string"
+                      country:
+                        type: "string"
+                      state:
+                        type: "string"
+                      text:
+                        type: "string"
+                      type:
+                        type: "string"
+                      use:
+                        type: "string"
+                  activo:
+                    type: "boolean"
+        "404":
+          description: "Paciente no encontrado"
+
+  /observaciones:
+    get:
+      summary: "Obtener observaciones clínicas del paciente"
+      operationId: "getObservaciones"
+      tags:
+        - "Observaciones"
+      parameters:
+        - name: "patient"
+          in: "query"
+          required: true
+          schema:
+            type: "string"
+            example: "Patient/54cad890-54c8-4c4d-9d71-0436cba78d5a"
+      responses:
+        "200":
+          description: "Observaciones clínicas obtenidas exitosamente"
+          content:
+            application/json:
+              schema:
+                type: "array"
+                items:
+                  type: "object"
+                  properties:
+                    observacion:
+                      type: "string"
+                    valor:
+                      type: "string"
+                    unidad:
+                      type: "string"
+                    rango_referencia:
+                      type: "object"
+                      properties:
+                        min:
+                          type: "number"
+                        max:
+                          type: "number"
+                    fecha:
+                      type: "string"
+                      format: "date-time"
+                    paciente_id:
+                      type: "string"
+        "404":
+          description: "No se encontraron observaciones clínicas" 

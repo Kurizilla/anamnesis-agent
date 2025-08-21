@@ -21,6 +21,7 @@ services:
     volumes:
       - ./secrets:/secrets:ro
       - ./fhir_clini_assistant:/app/fhir_clini_assistant:ro
+      - ./fhir_clini_assistant_live:/app/fhir_clini_assistant_live:ro
       - ./app:/app/app:ro
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 

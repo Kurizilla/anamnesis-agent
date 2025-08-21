@@ -848,10 +848,14 @@ class GetMotivoConsultaTool(BaseTool):
 
     if not enc_id:
       logger.warning("No triage encounter found for patient=%r", patient)
-      raise types.FunctionCallError(
-          code="NOT_FOUND",
-          message="No se encontró Encounter de triage reciente para el paciente",
-      )
+      # Devolver mensaje para que el agente pida motivos en la conversación
+      return {
+        "encounter_id": "",
+        "motivos": [],
+        "detalles": [],
+        "priorizacion": [],
+        "mensaje": "Este paciente no tiene motivos de consulta registrados. Pregunta por el motivo principal de consulta.",
+      }
 
     # 2) Obtener QuestionnaireResponse por encounter
     qr_resp = self._session.get(
@@ -948,12 +952,16 @@ class GetMotivoConsultaTool(BaseTool):
       enc_id, motivos_checked, motivos_aceptados, len(motivos_fmt), len(detalles), len(priorizacion)
     )
 
-    return {
+    result = {
       "encounter_id": enc_id,
       "motivos": motivos_fmt,
       "detalles": detalles,
       "priorizacion": priorizacion,
     }
+    if not motivos_fmt:
+      # Señal amistosa para el agente cuando no hay motivos cargados
+      result["mensaje"] = "Este paciente no tiene motivos de consulta registrados. Pregunta por el motivo principal de consulta."
+    return result
 
 
 class GetAreasAfectadasTool(BaseTool):

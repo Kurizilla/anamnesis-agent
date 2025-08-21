@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Body
+from fastapi import FastAPI, Body, Request
 from pydantic import BaseModel
 from google.adk.cli.utils.agent_loader import AgentLoader
 from google.adk.runners import InMemoryRunner
@@ -7,14 +7,38 @@ import logging
 import os
 from pathlib import Path
 import asyncio
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, Response
 from datetime import datetime, timezone
+from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional
+from google.auth import default as google_auth_default
+from google.auth.transport.requests import AuthorizedSession
+from google import genai
+from google.genai import types as genai_types
+import io, wave
+import uuid, json, base64
+from fastapi import WebSocket, WebSocketDisconnect
+from fhir_clini_assistant.agent import _INSTRUCTION as LIVE_SYSTEM_INSTRUCTION
 
 logging.basicConfig(
   level=getattr(logging, os.getenv("LOGLEVEL", "INFO")),
   format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# Helper to describe an agent (model/instruction)
+def _describe_agent(agent_obj):
+  info = {}
+  try:
+    info["model"] = getattr(agent_obj, "model", None)
+  except Exception:
+    info["model"] = None
+  try:
+    instr = getattr(agent_obj, "instruction", None)
+    info["instruction_preview"] = (instr[:240] + "…") if isinstance(instr, str) and len(instr) > 240 else instr
+  except Exception:
+    info["instruction_preview"] = None
+  return info
 
 DEFAULT_AGENTS_DIR = str(Path(__file__).resolve().parents[1])
 AGENTS_DIR = os.getenv("AGENTS_DIR", DEFAULT_AGENTS_DIR)
@@ -25,9 +49,111 @@ SESSION_TO_PATIENT: dict[str, str] = {}
 SESSION_TO_ENCOUNTER: dict[str, str] = {}
 SESSION_TO_TRANSCRIPT: dict[str, list[tuple[str, str]]] = {}
 
+# Live audio session manager (SDK-based)
+class _LiveSessionState:
+  def __init__(self, session_id: str):
+    self.id = session_id
+    self.in_q: asyncio.Queue = asyncio.Queue()  # items: {"type":"text"|"audio","data":..., "mime":...}
+    self.out_q: asyncio.Queue = asyncio.Queue() # items sent to SSE as dict
+    self.worker: asyncio.Task | None = None
+    self.closed: bool = False
+
+LIVE_SESSIONS: dict[str, _LiveSessionState] = {}
+
+async def _live_worker(state: _LiveSessionState):
+  model_id = os.getenv("LIVE_MODEL", "gemini-live-2.5-flash-preview-native-audio")
+  client = genai.Client()
+  cfg = genai_types.LiveConnectConfig(
+    response_modalities=["AUDIO"],
+    input_audio_transcription=genai_types.AudioTranscriptionConfig(),
+    output_audio_transcription=genai_types.AudioTranscriptionConfig(),
+    speech_config=genai_types.SpeechConfig(
+      voice_config=genai_types.VoiceConfig(
+        prebuilt_voice_config=genai_types.PrebuiltVoiceConfig(voice_name="Kore")
+      )
+    ),
+    system_instruction=genai_types.Content(role="system", parts=[genai_types.Part(text=LIVE_SYSTEM_INSTRUCTION)]),
+  )
+  try:
+    async with client.aio.live.connect(model=model_id, config=cfg) as session:
+      async def _sender():
+        while True:
+          item = await state.in_q.get()
+          if item is None:
+            break
+          try:
+            if item.get("type") == "text":
+              text = item.get("data") or ""
+              await session.send_client_content(
+                turns=genai_types.Content(role="user", parts=[genai_types.Part(text=text)]),
+                turn_complete=True,
+              )
+            elif item.get("type") == "audio":
+              data = item.get("data") or b""
+              mime = item.get("mime") or "audio/pcm;rate=16000"
+              await session.send_realtime_input(audio=genai_types.Blob(data=data, mime_type=mime))
+          except Exception as e:
+            await state.out_q.put({"event": "error", "message": f"sender_error: {e}"})
+
+      async def _receiver():
+        async for message in session.receive():
+          try:
+            sc = getattr(message, "server_content", None)
+            if not sc:
+              continue
+            # Transcriptions
+            if getattr(sc, "input_transcription", None) and getattr(sc.input_transcription, "text", None):
+              await state.out_q.put({"event": "input_transcription", "text": sc.input_transcription.text})
+            if getattr(sc, "output_transcription", None) and getattr(sc.output_transcription, "text", None):
+              await state.out_q.put({"event": "output_transcription", "text": sc.output_transcription.text})
+            # Audio chunks from model
+            mt = getattr(sc, "model_turn", None)
+            if mt and getattr(mt, "parts", None):
+              for p in mt.parts:
+                if getattr(p, "inline_data", None) and getattr(p.inline_data, "data", None):
+                  b = p.inline_data.data  # raw PCM int16 24kHz
+                  await state.out_q.put({
+                    "event": "audio_chunk",
+                    "mime": "audio/pcm;rate=24000",
+                    "data": base64.b64encode(b).decode("ascii"),
+                  })
+          except Exception as e:
+            await state.out_q.put({"event": "error", "message": f"receiver_error: {e}"})
+        # End of stream
+        await state.out_q.put({"event": "closed"})
+
+      send_task = asyncio.create_task(_sender())
+      recv_task = asyncio.create_task(_receiver())
+      await asyncio.gather(send_task, recv_task)
+  except Exception as e:
+    await state.out_q.put({"event": "error", "message": f"live_connect_error: {e}"})
+  finally:
+    state.closed = True
+
 loader = AgentLoader(agents_dir=AGENTS_DIR)
+logger.info("AGENTS_DIR=%s AGENT_NAME=%s", AGENTS_DIR, AGENT_NAME)
 agent = loader.load_agent(AGENT_NAME)
 runner = InMemoryRunner(agent=agent, app_name="clini_assistant_api")
+
+# Load live voice agent alongside the text agent
+LIVE_AGENT_NAME = os.getenv("AGENT_NAME_LIVE", "fhir_clini_assistant_live")
+logger.info("LIVE_AGENT_NAME=%s", LIVE_AGENT_NAME)
+try:
+  live_agent = loader.load_agent(LIVE_AGENT_NAME)
+  live_runner = InMemoryRunner(agent=live_agent, app_name="clini_assistant_live_api")
+  try:
+    tools = []
+    for t in getattr(live_agent, "tools", []) or []:
+      tn = getattr(t, "name", None) or t.__class__.__name__
+      tools.append(tn)
+    logger.info("LIVE_TOOLS_LOADED: %s", ", ".join(tools))
+    logger.info("LIVE_AGENT_DESC: %s", _describe_agent(live_agent))
+  except Exception as e:
+    logger.warning("LIVE_TOOLS_LIST_ERROR: %s", e)
+except Exception as e:
+  live_agent = None
+  live_runner = None
+  logger.warning("LIVE_AGENT_LOAD_FAIL: %s", e)
 
 # Log tools on startup
 try:
@@ -42,11 +168,23 @@ except Exception as e:
 
 app = FastAPI(title="Clini Assistant API")
 
+# Allow Streamlit UI (8501) to call this backend
+app.add_middleware(
+  CORSMiddleware,
+  allow_origins=[
+    "http://localhost:8501",
+    "http://127.0.0.1:8501",
+  ],
+  allow_credentials=True,
+  allow_methods=["*"],
+  allow_headers=["*"],
+)
+
 class ChatRequest(BaseModel):
   user_id: str
   message: str
-  patient_id: str | None = None
-  session_id: str | None = None
+  patient_id: Optional[str] = None
+  session_id: Optional[str] = None
 
 class BootstrapRequest(BaseModel):
   user_id: str
@@ -62,6 +200,25 @@ async def debug_tools():
     return JSONResponse({"tools": tools})
   except Exception as e:
     return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.get("/debug/live_tools")
+async def debug_live_tools():
+  if not live_agent:
+    return JSONResponse({"error": "live_agent not available", "agents_dir": AGENTS_DIR, "live_agent_name": LIVE_AGENT_NAME}, status_code=503)
+  try:
+    tools = []
+    for t in getattr(live_agent, "tools", []) or []:
+      tn = getattr(t, "name", None) or t.__class__.__name__
+      tools.append(tn)
+    return JSONResponse({"tools": tools, "agents_dir": AGENTS_DIR, "live_agent_name": LIVE_AGENT_NAME})
+  except Exception as e:
+    return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.get("/debug/live_agent")
+async def debug_live_agent():
+  if not live_agent:
+    return JSONResponse({"error": "live_agent not available", "agents_dir": AGENTS_DIR, "live_agent_name": LIVE_AGENT_NAME}, status_code=503)
+  return JSONResponse({"agent": _describe_agent(live_agent)})
 
 @app.post("/bootstrap")
 async def bootstrap(req: BootstrapRequest):
@@ -106,6 +263,7 @@ async def bootstrap(req: BootstrapRequest):
 
   nombre = (patient_res or {}).get("nombre") if isinstance(patient_res, dict) else None
   motivos = (motivos_res or {}).get("motivos") if isinstance(motivos_res, dict) else None
+  motivos_msg = (motivos_res or {}).get("mensaje") if isinstance(motivos_res, dict) else None
   areas = (areas_res or {}).get("areas") if isinstance(areas_res, dict) else None
   imc_val = None
   imc_score = None
@@ -225,7 +383,10 @@ async def bootstrap(req: BootstrapRequest):
 
   context_lines = []
   if nombre: context_lines.append(f"Paciente: {nombre}")
-  if motivos: context_lines.append("Motivos: " + ", ".join(motivos))
+  if motivos:
+    context_lines.append("Motivos: " + ", ".join(motivos))
+  elif motivos_msg:
+    context_lines.append("[hint] No hay motivos de consulta registrados en el triage; pide el motivo principal al paciente.")
   if areas: context_lines.append("Áreas afectadas: " + ", ".join(areas))
   if imc_val is not None:
     context_lines.append(f"IMC: {imc_val} (score {imc_score if imc_score is not None else 'NA'})")
@@ -259,11 +420,17 @@ async def bootstrap(req: BootstrapRequest):
   ]
   if context_lines:
     parts.append(types.Part.from_text(text=f"[contexto_inicial] {' | '.join(context_lines)}"))
-  # Kickoff instruction
-  kickoff = (
-    "Inicia la consulta con saludo empático, menciona nombre, motivos y áreas afectadas disponibles, "
-    "y formula la primera pregunta abierta para caracterizar el problema principal."
-  )
+  # Kickoff instruction (condicional según motivos)
+  if motivos:
+    kickoff = (
+      "Inicia la consulta con saludo empático, menciona nombre, motivos y áreas afectadas disponibles, "
+      "y formula la primera pregunta abierta para caracterizar el problema principal."
+    )
+  else:
+    kickoff = (
+      "Inicia la consulta con saludo empático. No asumas motivos de consulta. Explica brevemente que no hay motivos registrados en triage "
+      "y pide de forma abierta que te cuente el motivo principal de consulta; luego continúa con preguntas de caracterización."
+    )
   parts.append(types.Part.from_text(text=kickoff))
   content = types.Content(role="user", parts=parts)
 
@@ -441,6 +608,480 @@ async def chat(req: ChatRequest):
   logger.info("CHAT_OK reply_len=%d", len(last_text or ""))
   return {"reply": last_text, "session_id": session_id}
 
+
+# ========== WebRTC (Vertex Live API) ==========
+def _build_live_webrtc_urls() -> list[str]:
+  project = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("PROJECT_ID")
+  location = os.getenv("GOOGLE_CLOUD_LOCATION") or os.getenv("GOOGLE_CLOUD_REGION") or "us-central1"
+  model = os.getenv("LIVE_MODEL", "gemini-live-2.5-flash-preview-native-audio")
+  # Endpoint override if provided
+  override = os.getenv("LIVE_WEBRTC_URL")
+  if override:
+    return [override]
+  # Correct Live API (native audio) endpoint shape candidates
+  return [
+    f"https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}:live:webrtc?model=publishers/google/models/{model}",
+    f"https://{location}-aiplatform.googleapis.com/v1beta1/projects/{project}/locations/{location}:live:webrtc?model=publishers/google/models/{model}",
+    f"https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/live:webrtc?model=publishers/google/models/{model}",
+    f"https://{location}-aiplatform.googleapis.com/v1beta1/projects/{project}/locations/{location}/live:webrtc?model=publishers/google/models/{model}",
+  ]
+
+@app.post("/live/webrtc/offer")
+async def webrtc_offer(payload: dict):
+  try:
+    offer_type = (payload or {}).get("type") or "offer"
+    offer_sdp = (payload or {}).get("sdp") or ""
+    if not offer_sdp:
+      return JSONResponse({"error": "missing sdp"}, status_code=400)
+    urls = _build_live_webrtc_urls()
+    creds, _ = google_auth_default()
+    sess = AuthorizedSession(creds)
+
+    # Try each URL: JSON first, then SDP fallback
+    for url in urls:
+      # JSON attempt
+      try:
+        body = {"type": offer_type, "sdp": offer_sdp}
+        headers = {"Content-Type": "application/json"}
+        logger.info("LIVE_WEBRTC_FORWARD_JSON url=%s len_sdp=%d", url, len(offer_sdp))
+        resp = sess.post(url, headers=headers, json=body)
+        if resp.status_code == 200 and (resp.json() or {}).get("sdp"):
+          ans = resp.json() or {}
+          return JSONResponse({"type": ans.get("type", "answer"), "sdp": ans.get("sdp", "")})
+        logger.warning("LIVE_WEBRTC_JSON_FAIL status=%s body_len=%d url=%s", resp.status_code, len(getattr(resp, 'text', '') or ''), url)
+      except Exception as e:
+        logger.warning("LIVE_WEBRTC_JSON_EXC url=%s err=%s", url, e)
+
+      # SDP attempt
+      sdp_url = url + ("&alt=sdp" if "?" in url else "?alt=sdp")
+      headers_sdp = {"Content-Type": "application/sdp", "Accept": "application/sdp"}
+      logger.info("LIVE_WEBRTC_FORWARD_SDP url=%s len_sdp=%d", sdp_url, len(offer_sdp))
+      resp2 = sess.post(sdp_url, headers=headers_sdp, data=offer_sdp)
+      if resp2.status_code == 200:
+        answer_sdp = resp2.text or ""
+        if not answer_sdp.strip():
+          logger.warning("LIVE_WEBRTC_SDP_EMPTY url=%s", sdp_url)
+        return JSONResponse({"type": "answer", "sdp": answer_sdp})
+      logger.warning("LIVE_WEBRTC_SDP_ERROR status=%s url=%s", resp2.status_code, sdp_url)
+
+    return JSONResponse({"error": "live_api_error", "status": 404, "body": "All endpoint variants returned non-200"}, status_code=502)
+  except Exception as e:
+    logger.exception("LIVE_WEBRTC_EXCEPTION: %s", e)
+    return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# Live voice endpoints (use live_runner/agent)
+@app.post("/bootstrap_live")
+async def bootstrap_live(req: BootstrapRequest):
+  if not live_runner:
+    logger.error("BOOTSTRAP_LIVE_UNAVAILABLE agents_dir=%s live_name=%s", AGENTS_DIR, LIVE_AGENT_NAME)
+    return JSONResponse({"error": "Live agent not available", "agents_dir": AGENTS_DIR, "live_agent_name": LIVE_AGENT_NAME}, status_code=503)
+  logger.info("BOOTSTRAP_LIVE_REQ user_id=%s patient_id=%s", req.user_id, req.patient_id)
+  logger.info("BOOTSTRAP_LIVE_AGENT_MODEL %s", getattr(live_agent, "model", None))
+  session = await live_runner.session_service.create_session(app_name="clini_assistant_live_api", user_id=req.user_id)
+  session_id = session.id
+  SESSION_TO_TRANSCRIPT[session_id] = []
+  # Reuse same prefetch and encounter creation as text
+  from fhir_clini_assistant.fhir_tools import GetPatientByIdTool, GetMotivoConsultaTool, GetAreasAfectadasTool, ScoreRiesgoTool
+  async def _safe(coro):
+    try:
+      return await coro
+    except Exception as e:
+      logger.warning("BOOTSTRAP_LIVE_PREFETCH_FAIL: %s", e)
+      return None
+  patient_res = await _safe(GetPatientByIdTool().run_async(args={"patient_id": req.patient_id}, tool_context=None))
+  motivos_res = await _safe(GetMotivoConsultaTool().run_async(args={"patient": req.patient_id}, tool_context=None))
+  areas_res = await _safe(GetAreasAfectadasTool().run_async(args={"patient": req.patient_id}, tool_context=None))
+  score_res = await _safe(ScoreRiesgoTool().run_async(args={"patient": req.patient_id}, tool_context=None))
+  # Context extraction similar to text bootstrap
+  nombre = (patient_res or {}).get("nombre") if isinstance(patient_res, dict) else None
+  motivos = (motivos_res or {}).get("motivos") if isinstance(motivos_res, dict) else None
+  motivos_msg = (motivos_res or {}).get("mensaje") if isinstance(motivos_res, dict) else None
+  areas = (areas_res or {}).get("areas") if isinstance(areas_res, dict) else None
+  context_lines = []
+  if nombre: context_lines.append(f"Paciente: {nombre}")
+  if motivos:
+    context_lines.append("Motivos: " + ", ".join(motivos))
+  elif motivos_msg:
+    context_lines.append("[hint] No hay motivos de consulta registrados en el triage; pide el motivo principal al paciente.")
+  if areas:
+    context_lines.append("Áreas afectadas: " + ", ".join(areas))
+  # Create Encounter
+  encounter_id = None
+  try:
+    from fhir_clini_assistant.fhir_tools import CreateEncounterTool
+    enc_tool = CreateEncounterTool()
+    enc_res = await enc_tool.run_async(args={"patient_id": req.patient_id, "session_id": session_id}, tool_context=None)
+    encounter_id = (enc_res or {}).get("encounter_id")
+    if encounter_id:
+      SESSION_TO_ENCOUNTER[session_id] = encounter_id
+    SESSION_TO_PATIENT[session_id] = req.patient_id
+    logger.info("BOOTSTRAP_LIVE_ENCOUNTER_CREATED id=%s", encounter_id)
+  except Exception as e:
+    logger.warning("BOOTSTRAP_LIVE_ENCOUNTER_FAIL: %s", e)
+  # Build kickoff and send first turn (brief for voice)
+  parts = [
+    types.Part.from_text(text=f"patient:{req.patient_id}"),
+    types.Part.from_text(text=f"session_id={session_id}"),
+  ]
+  if context_lines:
+    parts.append(types.Part.from_text(text=f"[contexto_inicial] {' | '.join(context_lines)}"))
+  if motivos:
+    kickoff_live = (
+      "Iniciemos. Veo motivos registrados. No asumas diagnósticos; en pocas palabras, cuéntame qué te preocupa más ahora mismo."
+    )
+  else:
+    kickoff_live = (
+      "Iniciemos. No tengo motivos registrados en triage. ¿Cuál es tu motivo principal de consulta hoy?"
+    )
+  parts.append(types.Part.from_text(text=kickoff_live))
+  content = types.Content(role="user", parts=parts)
+  logger.info("BOOTSTRAP_LIVE_KICKOFF parts=%d", len(parts))
+  for i, p in enumerate(parts):
+    try:
+      logger.debug("BOOTSTRAP_LIVE_PART[%d]=%s", i, (p.text or "")[:200])
+    except Exception:
+      pass
+  first_reply = None
+  async for event in live_runner.run_async(user_id=req.user_id, session_id=session_id, new_message=content):
+    if event.content and event.content.parts:
+      text = "".join([p.text or "" for p in event.content.parts if p.text])
+      if text:
+        first_reply = text
+  if first_reply:
+    SESSION_TO_TRANSCRIPT.setdefault(session_id, []).append(("agent", first_reply))
+  return {"session_id": session_id, "reply": first_reply, "encounter_id": encounter_id}
+
+
+@app.post("/chat_live")
+async def chat_live(req: ChatRequest):
+  if not live_runner:
+    return JSONResponse({"error": "Live agent not available"}, status_code=503)
+  logger.info("CHAT_LIVE_REQ user_id=%s session_id=%s", req.user_id, req.session_id)
+  logger.info("CHAT_LIVE_AGENT_MODEL %s", getattr(live_agent, "model", None))
+  # Ensure session
+  if req.session_id:
+    session_id = req.session_id
+    just_created = False
+  else:
+    session = await live_runner.session_service.create_session(app_name="clini_assistant_live_api", user_id=req.user_id)
+    session_id = session.id
+    just_created = True
+  # Track user message
+  SESSION_TO_TRANSCRIPT.setdefault(session_id, []).append(("user", req.message or ""))
+  # Build parts
+  parts = [types.Part.from_text(text=req.message or "")]
+  pid = req.patient_id or SESSION_TO_PATIENT.get(session_id)
+  if pid:
+    parts.append(types.Part.from_text(text=f"patient:{pid}"))
+  parts.append(types.Part.from_text(text=f"session_id={session_id}"))
+  content = types.Content(role="user", parts=parts)
+  logger.info("CHAT_LIVE_SEND parts=%d", len(parts))
+  # Run
+  last_text = None
+  async for event in live_runner.run_async(user_id=req.user_id, session_id=session_id, new_message=content):
+    if event.content and event.content.parts:
+      text = "".join([p.text or "" for p in event.content.parts if p.text])
+      if text:
+        last_text = text
+  if last_text:
+    SESSION_TO_TRANSCRIPT.setdefault(session_id, []).append(("agent", last_text))
+  return {"reply": last_text, "session_id": session_id}
+
+
+# ---------- Live Connect (SDK) TTS fallback ----------
+@app.post("/live/tts")
+async def live_tts(req: dict):
+  try:
+    text = (req or {}).get("text") or "Hola, esta es una prueba de voz del agente Live."
+    client = genai.Client()
+    cfg = genai_types.LiveConnectConfig(
+      response_modalities=["AUDIO"],
+      input_audio_transcription=genai_types.AudioTranscriptionConfig(),
+      output_audio_transcription=genai_types.AudioTranscriptionConfig(),
+      proactivity=genai_types.ProactivityConfig(proactive_audio=True),
+    )
+    model_id = os.getenv("LIVE_MODEL", "gemini-live-2.5-flash")
+    audio_chunks: list[bytes] = []
+
+    async with client.aio.live.connect(model=model_id, config=cfg) as session:
+      await session.send_client_content(
+        turns=genai_types.Content(role="user", parts=[genai_types.Part(text=text)])
+      )
+      async for message in session.receive():
+        sc = getattr(message, "server_content", None)
+        if not sc:
+          continue
+        mt = getattr(sc, "model_turn", None)
+        if mt and getattr(mt, "parts", None):
+          for p in mt.parts:
+            if getattr(p, "inline_data", None) and getattr(p.inline_data, "data", None):
+              audio_chunks.append(p.inline_data.data)
+    raw_pcm = b"".join(audio_chunks)
+    if not raw_pcm:
+      return JSONResponse({"error": "no_audio_returned"}, status_code=502)
+    # Wrap PCM 16-bit mono 24kHz into WAV
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+      wf.setnchannels(1)
+      wf.setsampwidth(2)
+      wf.setframerate(24000)
+      wf.writeframes(raw_pcm)
+    return Response(content=buf.getvalue(), media_type="audio/wav")
+  except Exception as e:
+    logger.exception("LIVE_TTS_ERROR: %s", e)
+    return JSONResponse({"error": str(e)}, status_code=500)
+
+# ---------- Live SDK audio<->audio endpoints (WebSocket) ----------
+@app.websocket("/live/ws")
+async def live_ws(websocket: WebSocket):
+  await websocket.accept()
+  # Params for prefetch/bootstrap
+  qp = websocket.query_params or {}
+  user_id = qp.get("user_id") or "u1"
+  patient_id = qp.get("patient_id") or ""
+  # Create a local session id for mapping Encounter/Transcript
+  ws_session_id = str(uuid.uuid4())
+  SESSION_TO_TRANSCRIPT[ws_session_id] = []
+
+  model_id = os.getenv("LIVE_MODEL", "gemini-live-2.5-flash-preview-native-audio")
+  client = genai.Client()
+  cfg = genai_types.LiveConnectConfig(
+    response_modalities=["AUDIO"],
+    input_audio_transcription=genai_types.AudioTranscriptionConfig(),
+    output_audio_transcription=genai_types.AudioTranscriptionConfig(),
+    speech_config=genai_types.SpeechConfig(
+      voice_config=genai_types.VoiceConfig(
+        prebuilt_voice_config=genai_types.PrebuiltVoiceConfig(voice_name="Kore")
+      )
+    ),
+    system_instruction=genai_types.Content(role="system", parts=[genai_types.Part(text=LIVE_SYSTEM_INSTRUCTION)]),
+  )
+  try:
+    async with client.aio.live.connect(model=model_id, config=cfg) as session:
+      # Prefetch (similar to /bootstrap) and Encounter/RiskAssessment
+      kickoff_live = None
+      try:
+        if patient_id:
+          from fhir_clini_assistant.fhir_tools import (
+            GetPatientByIdTool, GetMotivoConsultaTool, GetAreasAfectadasTool,
+            ScoreRiesgoTool, CreateEncounterTool, CreateRiskAssessmentTool,
+          )
+          # Prefetch data
+          patient_tool = GetPatientByIdTool()
+          motivos_tool = GetMotivoConsultaTool()
+          areas_tool = GetAreasAfectadasTool()
+          score_tool = ScoreRiesgoTool()
+          p_task = asyncio.create_task(patient_tool.run_async(args={"patient_id": patient_id}, tool_context=None))
+          m_task = asyncio.create_task(motivos_tool.run_async(args={"patient": patient_id}, tool_context=None))
+          a_task = asyncio.create_task(areas_tool.run_async(args={"patient": patient_id}, tool_context=None))
+          s_task = asyncio.create_task(score_tool.run_async(args={"patient": patient_id}, tool_context=None))
+          patient_res, motivos_res, areas_res, score_res = await asyncio.gather(p_task, m_task, a_task, s_task)
+          nombre = (patient_res or {}).get("nombre") if isinstance(patient_res, dict) else None
+          motivos = (motivos_res or {}).get("motivos") if isinstance(motivos_res, dict) else None
+          motivos_msg = (motivos_res or {}).get("mensaje") if isinstance(motivos_res, dict) else None
+          areas = (areas_res or {}).get("areas") if isinstance(areas_res, dict) else None
+          # Create Encounter
+          try:
+            enc_tool = CreateEncounterTool()
+            enc_res = await enc_tool.run_async(args={"patient_id": patient_id, "session_id": ws_session_id}, tool_context=None)
+            enc_id = (enc_res or {}).get("encounter_id")
+            if enc_id:
+              SESSION_TO_ENCOUNTER[ws_session_id] = enc_id
+            SESSION_TO_PATIENT[ws_session_id] = patient_id
+            logger.info("LIVE_WS_ENCOUNTER_CREATED id=%s", enc_id)
+          except Exception as e:
+            logger.warning("LIVE_WS_ENCOUNTER_FAIL: %s", e)
+          # RiskAssessment (same rationale light)
+          try:
+            outcome_map = {"bajo": "low", "medio": "medium", "alto": "high"}
+            rg = (score_res or {}).get("riesgo_global") or {}
+            outcome_code = outcome_map.get(str(rg.get("categoria", "")).lower(), "low")
+            rationale = ""
+            try:
+              imc = (score_res or {}).get("imc") or {}
+              parts = []
+              if imc.get("valor") is not None:
+                parts.append(f"IMC {imc.get('valor')}")
+              an = (score_res or {}).get("analitos") or {}
+              if (an.get("fpg") or {}).get("valor") is not None:
+                parts.append(f"FPG {an['fpg'].get('valor')}")
+              if (an.get("hba1c") or {}).get("valor") is not None:
+                parts.append(f"HbA1c {an['hba1c'].get('valor')}")
+              rationale = "; ".join(parts) or None
+            except Exception:
+              rationale = None
+            ra_args = {
+              "patient_id": patient_id,
+              "session_id": ws_session_id,
+              "outcome": outcome_code,
+              "rationale": rationale or f"Resultado de riesgo {outcome_code}.",
+              "occurrence_datetime": datetime.now(timezone.utc).isoformat(),
+              "evidence": (score_res or {}).get("evidence"),
+            }
+            ra_res = await CreateRiskAssessmentTool().run_async(args=ra_args, tool_context=None)
+            logger.info("LIVE_WS_RISK_CREATED id=%s", (ra_res or {}).get("risk_assessment_id"))
+          except Exception as e:
+            logger.warning("LIVE_WS_RISK_FAIL: %s", e)
+          # Compose kickoff like text bootstrap
+          lines = []
+          if nombre: lines.append(f"Paciente: {nombre}")
+          if motivos:
+            lines.append("Motivos: " + ", ".join(motivos))
+          elif motivos_msg:
+            lines.append("[hint] No hay motivos de consulta registrados en el triage; pide el motivo principal al paciente.")
+          if areas: lines.append("Áreas afectadas: " + ", ".join(areas))
+          if motivos:
+            kickoff_live = (
+              "Inicia la consulta con saludo empático, menciona nombre, motivos y áreas afectadas disponibles, y formula la primera pregunta abierta para caracterizar el problema principal."
+            )
+          else:
+            kickoff_live = (
+              "Inicia la consulta con saludo empático. No asumas motivos de consulta. Explica brevemente que no hay motivos registrados en triage y pide de forma abierta que te cuente el motivo principal de consulta; luego continúa con preguntas de caracterización."
+            )
+          parts0 = [
+            genai_types.Part(text=f"patient:{patient_id}"),
+            genai_types.Part(text=f"session_id={ws_session_id}"),
+          ]
+          if lines:
+            parts0.append(genai_types.Part(text=f"[contexto_inicial] {' | '.join(lines)}"))
+          if kickoff_live:
+            parts0.append(genai_types.Part(text=kickoff_live))
+          await session.send_client_content(
+            turns=genai_types.Content(role="user", parts=parts0),
+            turn_complete=True,
+          )
+      except Exception as e:
+        logger.warning("LIVE_WS_PREFETCH_FAIL: %s", e)
+
+      async def _sender_from_ws():
+        while True:
+          try:
+            msg = await websocket.receive()
+          except WebSocketDisconnect:
+            break
+          data = msg.get("bytes")
+          text = msg.get("text")
+          try:
+            if data is not None:
+              await session.send_realtime_input(
+                audio=genai_types.Blob(data=data, mime_type="audio/pcm;rate=16000")
+              )
+            elif text:
+              try:
+                j = json.loads(text)
+                if j.get("type") == "text":
+                  t = j.get("text") or ""
+                  await session.send_client_content(
+                    turns=genai_types.Content(role="user", parts=[genai_types.Part(text=t)]),
+                    turn_complete=True,
+                  )
+              except Exception:
+                await session.send_client_content(
+                  turns=genai_types.Content(role="user", parts=[genai_types.Part(text=text)]),
+                  turn_complete=True,
+                )
+          except Exception as e:
+            await websocket.send_text(json.dumps({"event": "error", "message": f"send_error: {e}"}))
+            break
+
+      async def _receiver_to_ws():
+        async for message in session.receive():
+          sc = getattr(message, "server_content", None)
+          if not sc:
+            continue
+          if getattr(sc, "input_transcription", None) and getattr(sc.input_transcription, "text", None):
+            await websocket.send_text(json.dumps({"event": "input_transcription", "text": sc.input_transcription.text}))
+            SESSION_TO_TRANSCRIPT.setdefault(ws_session_id, []).append(("user", sc.input_transcription.text))
+          if getattr(sc, "output_transcription", None) and getattr(sc.output_transcription, "text", None):
+            await websocket.send_text(json.dumps({"event": "output_transcription", "text": sc.output_transcription.text}))
+            SESSION_TO_TRANSCRIPT.setdefault(ws_session_id, []).append(("agent", sc.output_transcription.text))
+          mt = getattr(sc, "model_turn", None)
+          if mt and getattr(mt, "parts", None):
+            for p in mt.parts:
+              if getattr(p, "inline_data", None) and getattr(p.inline_data, "data", None):
+                await websocket.send_bytes(p.inline_data.data)
+
+      send_task = asyncio.create_task(_sender_from_ws())
+      recv_task = asyncio.create_task(_receiver_to_ws())
+      await asyncio.gather(send_task, recv_task)
+  except Exception as e:
+    try:
+      await websocket.send_text(json.dumps({"event": "error", "message": str(e)}))
+    except Exception:
+      pass
+  finally:
+    try:
+      await websocket.close()
+    except Exception:
+      pass
+
+# ---------- Live SDK audio<->audio endpoints ----------
+@app.post("/live/session/start")
+async def live_session_start():
+  sid = str(uuid.uuid4())
+  state = _LiveSessionState(session_id=sid)
+  LIVE_SESSIONS[sid] = state
+  state.worker = asyncio.create_task(_live_worker(state))
+  logger.info("LIVE_SESSION_START id=%s", sid)
+  return {"session_id": sid}
+
+@app.post("/live/session/send-text")
+async def live_session_send_text(payload: dict):
+  sid = (payload or {}).get("session_id")
+  text = (payload or {}).get("text") or ""
+  st = LIVE_SESSIONS.get(sid)
+  if not st:
+    return JSONResponse({"error": "invalid_session"}, status_code=404)
+  await st.in_q.put({"type": "text", "data": text})
+  return {"ok": True}
+
+@app.post("/live/session/send-audio")
+async def live_session_send_audio(request: Request, session_id: str):
+  st = LIVE_SESSIONS.get(session_id)
+  if not st:
+    return JSONResponse({"error": "invalid_session"}, status_code=404)
+  data = await request.body()
+  if not data:
+    return JSONResponse({"error": "empty_body"}, status_code=400)
+  await st.in_q.put({"type": "audio", "data": data, "mime": "audio/pcm;rate=16000"})
+  return {"ok": True}
+
+@app.get("/live/session/receive")
+async def live_session_receive(session_id: str):
+  st = LIVE_SESSIONS.get(session_id)
+  if not st:
+    return JSONResponse({"error": "invalid_session"}, status_code=404)
+
+  async def _gen():
+    try:
+      # Initial hello
+      yield f"data: {json.dumps({'event': 'open'})}\n\n"
+      while True:
+        msg = await st.out_q.get()
+        yield f"data: {json.dumps(msg)}\n\n"
+        if msg.get("event") in ("closed", "error"):
+          break
+    except asyncio.CancelledError:
+      pass
+
+  return StreamingResponse(_gen(), media_type="text/event-stream")
+
+@app.post("/live/session/stop")
+async def live_session_stop(payload: dict):
+  sid = (payload or {}).get("session_id")
+  st = LIVE_SESSIONS.pop(sid, None)
+  if not st:
+    return {"ok": True}
+  try:
+    await st.in_q.put(None)
+    if st.worker and not st.worker.done():
+      st.worker.cancel()
+  except Exception:
+    pass
+  logger.info("LIVE_SESSION_STOP id=%s", sid)
+  return {"ok": True}
+
 @app.get("/healthz")
 async def healthz():
   return {"status": "ok"}
@@ -486,12 +1127,20 @@ async def ui_index():
   </style>
   <script>
     let sessionId = localStorage.getItem('session_id') || '';
+    let liveSessionId = localStorage.getItem('session_id_live') || '';
     function setSession(id){
       sessionId = id || '';
       if(sessionId) localStorage.setItem('session_id', sessionId); else localStorage.removeItem('session_id');
       document.getElementById('session_id').value = sessionId;
       const pid = document.getElementById('patient_id');
       pid.disabled = !!sessionId;
+    }
+    function setLiveSession(id){
+      liveSessionId = id || '';
+      if(liveSessionId) localStorage.setItem('session_id_live', liveSessionId); else localStorage.removeItem('session_id_live');
+      document.getElementById('session_id_live').value = liveSessionId;
+      const pid = document.getElementById('patient_id_live');
+      pid.disabled = !!liveSessionId;
     }
     async function sendMessage(){
       const btn = document.getElementById('send_btn');
@@ -519,8 +1168,46 @@ async def ui_index():
     }
     function resetSession(){ setSession(''); appendLine('[sesión reiniciada]'); }
     function appendLine(text){ const t=document.getElementById('transcript'); t.textContent += (t.textContent?'\n':'') + text; t.scrollTop=t.scrollHeight; }
+    // Voice tab helpers
+    async function bootstrapLive(){
+      const userId = document.getElementById('user_id_live').value.trim() || 'u1';
+      const patientId = document.getElementById('patient_id_live').value.trim();
+      if(!patientId){ alert('Ingresa un Patient ID'); return; }
+      const btn = document.getElementById('live_bootstrap_btn');
+      btn.disabled = true; btn.textContent = 'Entrando…';
+      try{
+        const res = await fetch('/bootstrap_live', { method:'POST', headers:{ 'Content-Type':'application/json' }, body: JSON.stringify({ user_id:userId, patient_id:patientId }) });
+        if(!res.ok){ const txt = await res.text(); alert('Error bootstrap: '+txt); return; }
+        const data = await res.json();
+        if(data.session_id && !liveSessionId) setLiveSession(data.session_id);
+        appendVoice('Agent: ' + (data.reply || '(sin respuesta)'));
+      } finally{ btn.disabled=false; btn.textContent='Entrar a la consulta'; }
+    }
+    function appendVoice(text){ const t=document.getElementById('voice_transcript'); t.textContent += (t.textContent?'\n':'') + text; t.scrollTop=t.scrollHeight; }
+    async function sendVoiceMessage(text){
+      const userId = document.getElementById('user_id_live').value.trim() || 'u1';
+      const payload = { user_id: userId, message: text, session_id: liveSessionId };
+      appendVoice('You: ' + text);
+      const res = await fetch('/chat_live', { method:'POST', headers:{ 'Content-Type':'application/json' }, body: JSON.stringify(payload) });
+      if(!res.ok){ const txt = await res.text(); appendVoice('Error: '+txt); return; }
+      const data = await res.json();
+      if(data.session_id && !liveSessionId) setLiveSession(data.session_id);
+      appendVoice('Agent: ' + (data.reply || '(sin respuesta)'));
+      speak((data.reply||''));
+    }
+    // Simple browser STT/TTS
+    let recog = null; let recognizing=false;
+    function initRecog(){ const R = window.SpeechRecognition || window.webkitSpeechRecognition; if(!R) return null; const r = new R(); r.lang='es-ES'; r.interimResults=false; r.maxAlternatives=1; r.onresult=(ev)=>{ const txt=ev.results[0][0].transcript; sendVoiceMessage(txt); }; r.onerror=(e)=>{ console.warn('recog error', e); }; r.onend=()=>{ recognizing=false; updateRecogUI(); }; return r; }
+    function startRecog(){ if(!recog) recog=initRecog(); if(!recog){ alert('Reconocimiento de voz no soportado en este navegador'); return; } recognizing=true; updateRecogUI(); recog.start(); }
+    function stopRecog(){ if(recog && recognizing){ recog.stop(); } recognizing=false; updateRecogUI(); }
+    function updateRecogUI(){ const b = document.getElementById('rec_btn'); if(!b) return; b.textContent = recognizing? 'Detener dictado' : 'Dictar'; }
+    function speak(text){ try{ const u=new SpeechSynthesisUtterance(text||''); u.lang='es-ES'; speechSynthesis.speak(u);}catch(e){} }
+    // Tabs
+    function showTab(tab){ const t=document.getElementById('text_card'); const v=document.getElementById('voice_card'); if(tab==='text'){ t.style.display='block'; v.style.display='none'; } else { t.style.display='none'; v.style.display='block'; } }
     window.addEventListener('DOMContentLoaded', ()=>{
       setSession(sessionId);
+      setLiveSession(liveSessionId);
+      showTab('text');
       document.getElementById('send_btn').addEventListener('click', (e)=>{ e.preventDefault(); sendMessage(); });
       document.getElementById('message').addEventListener('keydown', (e)=>{
         if((e.ctrlKey||e.metaKey) && e.key==='Enter'){ e.preventDefault(); sendMessage(); }
@@ -530,7 +1217,13 @@ async def ui_index():
 </head>
 <body>
   <div class=\"wrap\">
-    <div class=\"card\">
+    <div class=\"card\" style=\"margin-bottom:12px\"> 
+      <div class=\"row\">
+        <button class=\"secondary\" type=\"button\" onclick=\"showTab('text')\">Texto</button>
+        <button class=\"secondary\" type=\"button\" onclick=\"showTab('voice')\">Voz (Live)</button>
+      </div>
+    </div>
+    <div id=\"text_card\" class=\"card\">
       <h2>Clini-Assistant (Local) <span class=\"pill\">modo oscuro</span></h2>
       <div class=\"row\">
         <div>
@@ -546,18 +1239,42 @@ async def ui_index():
           <input id=\"session_id\" placeholder=\"auto\" disabled />
         </div>
       </div>
-      <div id="transcript" style="margin-top:12px;"></div>
-      <div class="row">
-        <div style="flex:1">
-          <label for="message">Mensaje</label>
-          <textarea id="message" rows="3" placeholder="Escribe tu mensaje... (Ctrl/Cmd + Enter para enviar)"></textarea>
+      <div id=\"transcript\" style=\"margin-top:12px;\"></div>
+      <div class=\"row\">
+        <div style=\"flex:1\">
+          <label for=\"message\">Mensaje</label>
+          <textarea id=\"message\" rows=\"3\" placeholder=\"Escribe tu mensaje... (Ctrl/Cmd + Enter para enviar)\"></textarea>
         </div>
       </div>
-      <div class="row">
-        <button id="send_btn" type="button" onclick="sendMessage()">Enviar</button>
-        <button class="secondary" type="button" onclick="resetSession()">Reiniciar sesión</button>
+      <div class=\"row\">
+        <button id=\"send_btn\" type=\"button\" onclick=\"sendMessage()\">Enviar</button>
+        <button class=\"secondary\" type=\"button\" onclick=\"resetSession()\">Reiniciar sesión</button>
       </div>
-      <div class="muted">Sugerencia: en el primer turno ingresa el Patient ID, luego continúa usando la misma sesión.</div>
+      <div class=\"muted\">Sugerencia: en el primer turno ingresa el Patient ID, luego continúa usando la misma sesión.</div>
+    </div>
+    <div id=\"voice_card\" class=\"card\" style=\"display:none\">
+      <h2>Clini-Assistant (Voz) <span class=\"pill\">preview</span></h2>
+      <div class=\"row\">
+        <div>
+          <label for=\"user_id_live\">User ID</label>
+          <input id=\"user_id_live\" value=\"u1\" />
+        </div>
+        <div>
+          <label for=\"patient_id_live\">Patient ID (primer turno)</label>
+          <input id=\"patient_id_live\" />
+        </div>
+        <div>
+          <label for=\"session_id_live\">Session ID</label>
+          <input id=\"session_id_live\" placeholder=\"auto\" disabled />
+        </div>
+      </div>
+      <div class=\"row\">
+        <button id=\"live_bootstrap_btn\" type=\"button\" onclick=\"bootstrapLive()\">Entrar a la consulta</button>
+        <button id=\"rec_btn\" class=\"secondary\" type=\"button\" onclick=\"recognizing?stopRecog():startRecog()\">Dictar</button>
+        <button class=\"secondary\" type=\"button\" onclick=\"setLiveSession(''); appendVoice('[sesión reiniciada]')\">Reiniciar sesión</button>
+      </div>
+      <div id=\"voice_transcript\" style=\"margin-top:12px; white-space:pre-wrap; background:#0a0f1c; border:1px solid var(--border); border-radius:10px; padding:12px; max-height:420px; min-height:180px; overflow:auto; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:13px\"></div>
+      <div class=\"muted\">Nota: Uso de reconocimiento y síntesis de voz del navegador para prototipado. El procesamiento clínico se hace con el agente Live.</div>
     </div>
   </div>
 </body>

@@ -19,6 +19,9 @@ import io, wave
 import uuid, json, base64
 from fastapi import WebSocket, WebSocketDisconnect
 from fhir_clini_assistant.agent import _INSTRUCTION as LIVE_SYSTEM_INSTRUCTION
+import importlib
+import re
+import ast
 
 logging.basicConfig(
   level=getattr(logging, os.getenv("LOGLEVEL", "INFO")),
@@ -135,6 +138,17 @@ logger.info("AGENTS_DIR=%s AGENT_NAME=%s", AGENTS_DIR, AGENT_NAME)
 agent = loader.load_agent(AGENT_NAME)
 runner = InMemoryRunner(agent=agent, app_name="clini_assistant_api")
 
+# Load dedicated agents for anamnesis and risk (text mode)
+anamnesis_runner = None
+risk_runner = None
+try:
+  from fhir_clini_assistant import anamnesis_agent as _ANAMNESIS_AGENT, risk_agent as _RISK_AGENT
+  anamnesis_runner = InMemoryRunner(agent=_ANAMNESIS_AGENT, app_name="clini_assistant_anamnesis")
+  risk_runner = InMemoryRunner(agent=_RISK_AGENT, app_name="clini_assistant_risk")
+  logger.info("SPECIALIZED_AGENTS: anamnesis and risk runners initialized")
+except Exception as e:
+  logger.warning("SPECIALIZED_AGENTS_LOAD_FAIL: %s", e)
+
 # Load live voice agent alongside the text agent
 LIVE_AGENT_NAME = os.getenv("AGENT_NAME_LIVE", "fhir_clini_assistant_live")
 logger.info("LIVE_AGENT_NAME=%s", LIVE_AGENT_NAME)
@@ -185,10 +199,12 @@ class ChatRequest(BaseModel):
   message: str
   patient_id: Optional[str] = None
   session_id: Optional[str] = None
+  agent_kind: Optional[str] = None  # "anamnesis" | "risk"
 
 class BootstrapRequest(BaseModel):
   user_id: str
   patient_id: str
+  agent_kind: Optional[str] = None  # "anamnesis" | "risk"
 
 @app.get("/debug/tools")
 async def debug_tools():
@@ -222,8 +238,16 @@ async def debug_live_agent():
 
 @app.post("/bootstrap")
 async def bootstrap(req: BootstrapRequest):
-  logger.info("BOOTSTRAP_REQ user_id=%s patient_id=%s", req.user_id, req.patient_id)
-  session = await runner.session_service.create_session(app_name="clini_assistant_api", user_id=req.user_id)
+  logger.info("BOOTSTRAP_REQ user_id=%s patient_id=%s agent_kind=%s", req.user_id, req.patient_id, req.agent_kind)
+  # Escoger runner según agente
+  agent_kind = (req.agent_kind or "anamnesis").strip().lower()
+  active_runner = runner
+  if agent_kind == "risk" and risk_runner is not None:
+    active_runner = risk_runner
+  elif agent_kind == "anamnesis" and anamnesis_runner is not None:
+    active_runner = anamnesis_runner
+
+  session = await active_runner.session_service.create_session(app_name=getattr(active_runner, "app_name", "clini_assistant_api"), user_id=req.user_id)
   session_id = session.id
   # Inicializar transcript
   SESSION_TO_TRANSCRIPT[session_id] = []
@@ -232,8 +256,6 @@ async def bootstrap(req: BootstrapRequest):
   patient_tool = GetPatientByIdTool()
   motivos_tool = GetMotivoConsultaTool()
   areas_tool = GetAreasAfectadasTool()
-  from fhir_clini_assistant.fhir_tools import ScoreRiesgoTool
-  score_tool = ScoreRiesgoTool()
   async def _safe(coro):
     try:
       return await coro
@@ -243,21 +265,29 @@ async def bootstrap(req: BootstrapRequest):
   patient_task = _safe(patient_tool.run_async(args={"patient_id": req.patient_id}, tool_context=None))
   motivos_task = _safe(motivos_tool.run_async(args={"patient": req.patient_id}, tool_context=None))
   areas_task = _safe(areas_tool.run_async(args={"patient": req.patient_id}, tool_context=None))
-  score_task = _safe(score_tool.run_async(args={"patient": req.patient_id}, tool_context=None))
-  patient_res, motivos_res, areas_res, score_res = await asyncio.gather(patient_task, motivos_task, areas_task, score_task)
+  # Solo calcular score de riesgo en el agente de riesgo
+  score_res = None
+  if agent_kind == "risk":
+    from fhir_clini_assistant.fhir_tools import ScoreRiesgoTool
+    score_tool = ScoreRiesgoTool()
+    score_task = _safe(score_tool.run_async(args={"patient": req.patient_id}, tool_context=None))
+    patient_res, motivos_res, areas_res, score_res = await asyncio.gather(patient_task, motivos_task, areas_task, score_task)
+  else:
+    patient_res, motivos_res, areas_res = await asyncio.gather(patient_task, motivos_task, areas_task)
 
-  # Crear Encounter in-progress para esta sesión
+  # Crear Encounter in-progress para esta sesión (con propósito según agente)
   encounter_id = None
   try:
     from fhir_clini_assistant.fhir_tools import CreateEncounterTool
     enc_tool = CreateEncounterTool()
-    enc_res = await enc_tool.run_async(args={"patient_id": req.patient_id, "session_id": session_id}, tool_context=None)
+    purpose = "risk" if agent_kind == "risk" else "anamnesis"
+    enc_res = await enc_tool.run_async(args={"patient_id": req.patient_id, "session_id": session_id, "purpose": purpose}, tool_context=None)
     encounter_id = (enc_res or {}).get("encounter_id")
     # Mapear sesión a encounter y patient para usos posteriores
     if encounter_id:
       SESSION_TO_ENCOUNTER[session_id] = encounter_id
     SESSION_TO_PATIENT[session_id] = req.patient_id
-    logger.info("BOOTSTRAP_ENCOUNTER_CREATED id=%s", encounter_id)
+    logger.info("BOOTSTRAP_ENCOUNTER_CREATED id=%s purpose=%s", encounter_id, purpose)
   except Exception as e:
     logger.warning("BOOTSTRAP_ENCOUNTER_FAIL: %s", e)
 
@@ -332,47 +362,48 @@ async def bootstrap(req: BootstrapRequest):
     riesgo_pts_obt = pts.get("obtenidos")
     riesgo_pts_max = pts.get("maximos")
 
-  # Crear RiskAssessment enlazado al Encounter y Patient
+  # Crear RiskAssessment únicamente en el flujo de riesgo
   risk_assessment_id = None
-  try:
-    outcome_map = {"bajo": "low", "medio": "medium", "alto": "high"}
-    outcome_code = outcome_map.get(str(riesgo_cat).lower(), "low")
-    # Componer rationale sencillo en prosa con variables disponibles
-    rationale_parts = []
-    if imc_val is not None: rationale_parts.append(f"IMC {imc_val} (score {imc_score if imc_score is not None else 'NA'})")
-    if cintura_val is not None: rationale_parts.append(f"cintura {cintura_val} cm (score {cintura_score if cintura_score is not None else 'NA'})")
-    if fumar_estado is not None: rationale_parts.append(f"tabaquismo: {fumar_estado} (score {fumar_score if fumar_score is not None else 'NA'})")
-    if fpg_val is not None and fpg_cat: rationale_parts.append(f"glucosa {fpg_val} mg/dL ({fpg_cat})")
-    if a1c_val is not None and a1c_cat: rationale_parts.append(f"HbA1c {a1c_val}% ({a1c_cat})")
-    if trig_val is not None: rationale_parts.append(f"triglicéridos {trig_val} mg/dL (score {trig_score if trig_score is not None else 'NA'})")
-    if hdl_val is not None: rationale_parts.append(f"HDL {hdl_val} mg/dL (score {hdl_score if hdl_score is not None else 'NA'})")
-    fam_score_local = None
+  if agent_kind == "risk":
     try:
-      if isinstance(score_res, dict):
-        fam = score_res.get("antecedentes_familiares") or {}
-        fam_score_local = fam.get("primer_grado_riesgo")
-    except Exception:
+      outcome_map = {"bajo": "low", "medio": "medium", "alto": "high"}
+      outcome_code = outcome_map.get(str(riesgo_cat).lower(), "low")
+      # Componer rationale sencillo en prosa con variables disponibles
+      rationale_parts = []
+      if imc_val is not None: rationale_parts.append(f"IMC {imc_val} (score {imc_score if imc_score is not None else 'NA'})")
+      if cintura_val is not None: rationale_parts.append(f"cintura {cintura_val} cm (score {cintura_score if cintura_score is not None else 'NA'})")
+      if fumar_estado is not None: rationale_parts.append(f"tabaquismo: {fumar_estado} (score {fumar_score if fumar_score is not None else 'NA'})")
+      if fpg_val is not None and fpg_cat: rationale_parts.append(f"glucosa {fpg_val} mg/dL ({fpg_cat})")
+      if a1c_val is not None and a1c_cat: rationale_parts.append(f"HbA1c {a1c_val}% ({a1c_cat})")
+      if trig_val is not None: rationale_parts.append(f"triglicéridos {trig_val} mg/dL (score {trig_score if trig_score is not None else 'NA'})")
+      if hdl_val is not None: rationale_parts.append(f"HDL {hdl_val} mg/dL (score {hdl_score if hdl_score is not None else 'NA'})")
       fam_score_local = None
-    if fam_score_local is not None: rationale_parts.append(f"antecedentes familiares (score {fam_score_local})")
-    rationale_text = (
-      f"Resultado de riesgo {outcome_code} basado en: " + ", ".join(rationale_parts) if rationale_parts else f"Resultado de riesgo {outcome_code}."
-    )
-    from fhir_clini_assistant.fhir_tools import CreateRiskAssessmentTool
-    ra_tool = CreateRiskAssessmentTool()
-    ra_args = {
-      "patient_id": req.patient_id,
-      "session_id": session_id,
-      "encounter_id": encounter_id,
-      "outcome": outcome_code,
-      "rationale": rationale_text,
-      "occurrence_datetime": datetime.now(timezone.utc).isoformat(),
-      "evidence": (score_res or {}).get("evidence"),
-    }
-    ra_res = await ra_tool.run_async(args=ra_args, tool_context=None)
-    risk_assessment_id = (ra_res or {}).get("risk_assessment_id")
-    logger.info("BOOTSTRAP_RISK_ASSESSMENT_CREATED id=%s outcome=%s", risk_assessment_id, outcome_code)
-  except Exception as e:
-    logger.warning("BOOTSTRAP_RISK_ASSESSMENT_FAIL: %s", e)
+      try:
+        if isinstance(score_res, dict):
+          fam = score_res.get("antecedentes_familiares") or {}
+          fam_score_local = fam.get("primer_grado_riesgo")
+      except Exception:
+        fam_score_local = None
+      if fam_score_local is not None: rationale_parts.append(f"antecedentes familiares (score {fam_score_local})")
+      rationale_text = (
+        f"Resultado de riesgo {outcome_code} basado en: " + ", ".join(rationale_parts) if rationale_parts else f"Resultado de riesgo {outcome_code}."
+      )
+      from fhir_clini_assistant.fhir_tools import CreateRiskAssessmentTool
+      ra_tool = CreateRiskAssessmentTool()
+      ra_args = {
+        "patient_id": req.patient_id,
+        "session_id": session_id,
+        "encounter_id": encounter_id,
+        "outcome": outcome_code,
+        "rationale": rationale_text,
+        "occurrence_datetime": datetime.now(timezone.utc).isoformat(),
+        "evidence": (score_res or {}).get("evidence") if isinstance(score_res, dict) else None,
+      }
+      ra_res = await ra_tool.run_async(args=ra_args, tool_context=None)
+      risk_assessment_id = (ra_res or {}).get("risk_assessment_id")
+      logger.info("BOOTSTRAP_RISK_ASSESSMENT_CREATED id=%s outcome=%s", risk_assessment_id, outcome_code)
+    except Exception as e:
+      logger.warning("BOOTSTRAP_RISK_ASSESSMENT_FAIL: %s", e)
 
   fam_score = None
   fam_matches = []
@@ -399,214 +430,407 @@ async def bootstrap(req: BootstrapRequest):
   if sexo_genero is not None:
     context_lines.append(f"Sexo: {sexo_genero} (score {sexo_score if sexo_score is not None else 'NA'})")
   if analytes_score is not None:
-    tags = []
-    if fpg_cat: tags.append(f"FPG {fpg_cat}")
-    if a1c_cat: tags.append(f"HbA1c {a1c_cat}")
-    extra = f" ({', '.join(tags)})" if tags else ""
-    context_lines.append(f"Analitos: score {analytes_score}{extra}")
+    context_lines.append(f"Analitos (score global): {analytes_score}")
+  if fpg_val is not None and fpg_cat is not None:
+    context_lines.append(f"Glucosa: {fpg_val} mg/dL ({fpg_cat})")
+  if a1c_val is not None and a1c_cat is not None:
+    context_lines.append(f"HbA1c: {a1c_val}% ({a1c_cat})")
   if trig_val is not None:
-    context_lines.append(f"Triglicéridos: {trig_val} mg/dL (score {trig_score if trig_score is not None else 'NA'})")
+    context_lines.append(f"Triglicéridos: {trig_val} (score {trig_score if trig_score is not None else 'NA'})")
   if hdl_val is not None:
-    context_lines.append(f"HDL: {hdl_val} mg/dL (score {hdl_score if hdl_score is not None else 'NA'})")
-  if riesgo_cat is not None and riesgo_pct is not None:
-    context_lines.append(f"Riesgo global: {riesgo_cat} ({riesgo_pct}% de {riesgo_pts_max} puntos)")
+    context_lines.append(f"HDL: {hdl_val} (score {hdl_score if hdl_score is not None else 'NA'})")
   if fam_score is not None:
-    context_lines.append(f"Antecedentes familiares (1er grado): score {fam_score} ({len(fam_matches)} coincidencias)")
+    context_lines.append(f"Antecedentes familiares (score): {fam_score} – {', '.join(fam_matches) if fam_matches else 'sin coincidencias destacadas'}")
 
-  parts = [
-    types.Part.from_text(text=f"patient:{req.patient_id}"),
-    types.Part.from_text(text=f"patient={req.patient_id}"),
-    types.Part.from_text(text=f"patient_id={req.patient_id}"),
-  ]
-  if context_lines:
-    parts.append(types.Part.from_text(text=f"[contexto_inicial] {' | '.join(context_lines)}"))
-  # Kickoff instruction (condicional según motivos)
-  if motivos:
-    kickoff = (
-      "Inicia la consulta con saludo empático, menciona nombre, motivos y áreas afectadas disponibles, "
-      "y formula la primera pregunta abierta para caracterizar el problema principal."
-    )
-  else:
-    kickoff = (
-      "Inicia la consulta con saludo empático. No asumas motivos de consulta. Explica brevemente que no hay motivos registrados en triage "
-      "y pide de forma abierta que te cuente el motivo principal de consulta; luego continúa con preguntas de caracterización."
-    )
-  parts.append(types.Part.from_text(text=kickoff))
+  kickoff = "\n".join(context_lines) if context_lines else None
+
+  # First agent message
+  parts = [types.Part.from_text(text=kickoff or "Hola, soy tu asistente clínico. ¿En qué puedo ayudarte hoy?")]
   content = types.Content(role="user", parts=parts)
-
-  first_reply = None
-  async for event in runner.run_async(user_id=req.user_id, session_id=session_id, new_message=content):
-    if event.content and event.content.parts:
-      text = "".join([p.text or "" for p in event.content.parts if p.text])
-      if text:
-        first_reply = text
-  # Guardar primer mensaje del agente en transcript
+  first_reply = ""
   try:
-    if first_reply:
-      SESSION_TO_TRANSCRIPT.setdefault(session_id, []).append(("agent", first_reply))
-  except Exception:
-    pass
-  logger.info(
-    "BOOTSTRAP_OK session_id=%s reply_len=%d nombre=%s motivos=%s areas=%s imc_val=%s imc_score=%s edad_val=%s edad_score=%s cintura_val=%s cintura_score=%s fumar_estado=%s fumar_score=%s sexo=%s sexo_score=%s analytes_score=%s trig_val=%s trig_score=%s hdl_val=%s hdl_score=%s riesgo_cat=%s riesgo_pct=%s fam_score=%s fam_matches=%s",
-    session_id, len(first_reply or ""), nombre, (len(motivos or []) if isinstance(motivos, list) else 0),
-    (len(areas or []) if isinstance(areas, list) else 0), imc_val, imc_score,
-    edad_val, edad_score, cintura_val, cintura_score, fumar_estado, fumar_score, sexo_genero, sexo_score, analytes_score, trig_val, trig_score, hdl_val, hdl_score, riesgo_cat, riesgo_pct, fam_score, len(fam_matches or [])
-  )
+    async for event in active_runner.run_async(user_id=req.user_id, session_id=session_id, new_message=content):
+      text_candidate = None
+      if hasattr(event, "data") and getattr(event.data, "text", None):
+        text_candidate = event.data.text
+      elif hasattr(event, "content") and getattr(getattr(event, "content", None), "parts", None):
+        try:
+          text_candidate = "".join([(p.text or "") for p in event.content.parts if getattr(p, "text", None)])
+        except Exception:
+          text_candidate = None
+      if text_candidate:
+        first_reply = text_candidate
+  except Exception as e:
+    logger.warning("BOOTSTRAP_AGENT_FAIL: %s", e)
+
+  # Guardar primer mensaje del agente en transcript
+  SESSION_TO_TRANSCRIPT.setdefault(session_id, []).append(("agent", first_reply))
+
   return {"session_id": session_id, "reply": first_reply, "prefetch": {
-    "nombre": nombre,
-    "motivos": motivos,
-    "areas": areas,
-    "imc": {"valor": imc_val, "score": imc_score},
-    "edad": {"valor": edad_val, "score": edad_score},
-    "cintura_cm": {"valor": cintura_val, "score": cintura_score},
-    "fumar": {"estado": fumar_estado, "score": fumar_score},
-    "sexo": {"genero": sexo_genero, "score": sexo_score},
-    "analitos": {"score": analytes_score, "fpg": {"valor": fpg_val, "categoria": fpg_cat}, "hba1c": {"valor": a1c_val, "categoria": a1c_cat}},
-    "trigliceridos": {"valor": trig_val, "score": trig_score},
-    "hdl": {"valor": hdl_val, "score": hdl_score},
-    "riesgo_global": {"categoria": riesgo_cat, "puntos": {"obtenidos": riesgo_pts_obt, "maximos": riesgo_pts_max, "porcentaje": riesgo_pct}},
-    "antecedentes_familiares": {"score": fam_score, "coincidencias": fam_matches},
+    "patient": patient_res, "motivos": motivos_res, "areas": areas_res, "score": score_res,
   }, "encounter_id": encounter_id, "risk_assessment_id": risk_assessment_id}
+
+async def _llm_extract_criterios(session_id: str, user_text: str):
+  try:
+    from fhir_clini_assistant.fhir_tools import get_checklist_snapshot, UpdateCriterioEstadoTool
+  except Exception as e:
+    logger.debug("CHECKLIST_EXTRACT_IMPORT_FAIL: %s", e)
+    return
+  snap = get_checklist_snapshot(session_id)
+  if not (snap and snap.get("exists")):
+    return
+  items = snap.get("pending_items") or []
+  if not items:
+    return
+  area = snap.get("area") or ""
+  try:
+    client = genai.Client()
+    model_id = os.getenv("ANAMNESIS_EXTRACTOR_MODEL", os.getenv("ANAMNESIS_AGENT_MODEL", "gemini-2.5-flash"))
+    system = (
+      "Eres un asistente clínico que extrae datos estructurados. "
+      "Recibirás un área clínica activa y una lista de criterios (checklist). "
+      "A partir del texto del paciente, indica qué criterios quedan satisfechos, su valor y una confianza 0..1. "
+      "Responde SOLO en JSON. Formatos válidos: {\"items\":[{\"criterio\":...,\"value\":...,\"confidence\":0.0-1.0}]} o bien una lista simple de esos objetos. "
+      "Usa exactamente los nombres de criterio provistos (case-insensitive). No inventes valores."
+    )
+    prompt = {
+      "area": area,
+      "criterios_pendientes": items,
+      "texto_paciente": user_text,
+      "output": {"items": [{"criterio": "<nombre exacto>", "value": "<resumen breve>", "confidence": 0.0}]}
+    }
+    logger.info("CHECKLIST_EXTRACT_REQ session_id=%s area=%s pending=%s text=%.120s", session_id, area, len(items), (user_text or "")[:120])
+    msg = genai_types.Content(role="user", parts=[genai_types.Part(text=system + "\n" + json.dumps(prompt, ensure_ascii=False))])
+    resp = await client.aio.models.generate_content(model=model_id, contents=[msg])
+    logger.info("CHECKLIST_EXTRACT_MODEL=%s", model_id)
+    text = ""
+    try:
+      if resp and resp.candidates and resp.candidates[0].content and resp.candidates[0].content.parts:
+        text = "".join([p.text or "" for p in resp.candidates[0].content.parts if getattr(p, "text", None)])
+    except Exception:
+      text = ""
+    logger.info("CHECKLIST_EXTRACT_RAW session_id=%s len=%d text=%.200s", session_id, len(text or ""), (text or "")[:200])
+    if not text:
+      return
+    # Parse JSON (tolerant)
+    data = None
+    try:
+      data = json.loads(text)
+    except Exception:
+      try:
+        start = text.find("[")
+        end = text.rfind("]")
+        if start >= 0 and end > start:
+          data = json.loads(text[start:end+1])
+      except Exception:
+        data = None
+    if data is None:
+      logger.info("CHECKLIST_EXTRACT_PARSE_FAIL session_id=%s", session_id)
+      return
+    # Normalize to list under key "items"
+    if isinstance(data, dict) and isinstance(data.get("items"), list):
+      items_out = data.get("items")
+    elif isinstance(data, list):
+      items_out = data
+    else:
+      logger.info("CHECKLIST_EXTRACT_PARSE_EMPTY session_id=%s", session_id)
+      return
+    tool = UpdateCriterioEstadoTool()
+    applied = 0
+    for obj in items_out:
+      try:
+        crit = (obj or {}).get("criterio")
+        val = (obj or {}).get("value")
+        conf = (obj or {}).get("confidence")
+        if conf is not None:
+          try:
+            conf = float(conf)
+          except Exception:
+            conf = None
+        if crit and val and (conf is None or conf >= float(os.getenv("ANAMNESIS_EXTRACT_CONF_THRESH", "0.6"))):
+          await tool.run_async(args={"session_id": session_id, "criterio": str(crit), "status": "answered", "value": str(val)}, tool_context=None)
+          applied += 1
+      except Exception as e:
+        logger.debug("CHECKLIST_EXTRACT_APPLY_FAIL criterio=%s err=%s", (obj or {}).get("criterio"), e)
+    logger.info("CHECKLIST_EXTRACT_APPLIED session_id=%s area=%s matched=%d", session_id, area, applied)
+  except Exception as e:
+    logger.debug("CHECKLIST_EXTRACT_FAIL: %s", e)
+
+def _extract_summary_from_text(text: str) -> Optional[str]:
+  if not text:
+    return None
+  # Look for a block starting with 'Resumen' lines
+  m = re.search(r"Resumen[\s\S]{0,40}?:\s*(.+)", text, re.IGNORECASE)
+  if m:
+    # Take from the match to the end, but cap length
+    return text[m.start():].strip()[:4000]
+  return None
+
+def _strip_tool_calls(text: str) -> str:
+  if not text:
+    return text
+  # Remove any lines that contain create_clinical_impression(...) or update_encounter_status(...)
+  lines = (text or "").splitlines()
+  cleaned = []
+  for ln in lines:
+    if re.search(r"\b(create_clinical_impression|update_encounter_status)\s*\(", ln):
+      continue
+    # remove inline code fences around those calls
+    ln2 = re.sub(r"`\s*(create_clinical_impression|update_encounter_status)\s*\([^`]*\)`", "", ln)
+    cleaned.append(ln2)
+  return "\n".join(cleaned).strip()
+
+async def _execute_tool_code(session_id: str, text: str) -> bool:
+  if not text:
+    return False
+  # Try tag block first
+  block = re.search(r"<execute_tool_code>([\s\S]+?)</execute_tool_code>", text)
+  code = block.group(1) if block else text
+  ran_any = False
+  try:
+    # Find all function calls with optional 'tools.' prefix
+    pattern = re.compile(r"(?:tools\.)?(create_clinical_impression|update_encounter_status)\s*\((.*?)\)", re.DOTALL | re.IGNORECASE)
+    matches = list(pattern.finditer(code))
+    if not matches:
+      return False
+    ft = importlib.import_module('fhir_clini_assistant.fhir_tools')
+    CreateClinicalImpressionTool = getattr(ft, 'CreateClinicalImpressionTool', None)
+    UpdateEncounterStatusTool = getattr(ft, 'UpdateEncounterStatusTool', None)
+    for m in matches:
+      fname = m.group(1).strip()
+      args_str = m.group(2)
+      # Robust kwargs parsing via AST (supports commas inside strings)
+      try:
+        node = ast.parse(f"f({args_str})", mode='eval')
+        if not isinstance(node.body, ast.Call):
+          continue
+        kwargs = {}
+        for kw in node.body.keywords:
+          kwargs[kw.arg] = ast.literal_eval(kw.value)
+      except Exception:
+        kwargs = {}
+      if fname == 'create_clinical_impression' and CreateClinicalImpressionTool:
+        ci_tool = CreateClinicalImpressionTool()
+        # normalize keys to 'summary'
+        if 'clinical_impression' in kwargs and 'summary' not in kwargs:
+          kwargs['summary'] = kwargs.pop('clinical_impression')
+        if 'impression' in kwargs and 'summary' not in kwargs:
+          kwargs['summary'] = kwargs.pop('impression')
+        res = await ci_tool.run_async(args=kwargs, tool_context=None)
+        logger.info("CI_CREATE_OK session_id=%s res=%s", session_id, (res or {}))
+        ran_any = True
+      elif fname == 'update_encounter_status' and UpdateEncounterStatusTool:
+        up_tool = UpdateEncounterStatusTool()
+        if 'encounter_id' not in kwargs and 'session_id' not in kwargs:
+          enc_id = SESSION_TO_ENCOUNTER.get(session_id)
+          if enc_id:
+            kwargs['encounter_id'] = enc_id
+          else:
+            kwargs['session_id'] = session_id
+        res = await up_tool.run_async(args=kwargs, tool_context=None)
+        logger.info("ENCOUNTER_UPDATE_OK session_id=%s res=%s", session_id, (res or {}))
+        ran_any = True
+  except Exception as e:
+    logger.warning("EXEC_TOOL_CODE_FAIL session_id=%s err=%s", session_id, e)
+  return ran_any
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
-  logger.info("CHAT_REQ user_id=%s session_id=%s patient_id=%s msg_len=%d", req.user_id, req.session_id, req.patient_id, len(req.message or ""))
-  # Create or reuse session
-  if req.session_id:
-    session_id = req.session_id
-    just_created = False
-  else:
-    session = await runner.session_service.create_session(app_name="clini_assistant_api", user_id=req.user_id)
-    session_id = session.id
-    just_created = True
-  logger.info("CHAT_SESSION id=%s created=%s", session_id, just_created)
+  session_id = req.session_id or ""
+  if not session_id:
+    return JSONResponse({"error": "session_id requerido"}, status_code=400)
+
+  # Escoger runner según agente
+  agent_kind = (req.agent_kind or "anamnesis").strip().lower()
+  active_runner = runner
+  if agent_kind == "risk" and risk_runner is not None:
+    active_runner = risk_runner
+  elif agent_kind == "anamnesis" and anamnesis_runner is not None:
+    active_runner = anamnesis_runner
+  logger.info("CHAT_SELECT session_id=%s agent_kind=%s runner=%s", session_id, agent_kind, getattr(active_runner, "app_name", "unknown"))
+
+  # Lazy-init checklist if missing (prefer anamnesis, but allow creation for any chat if needed)
+  try:
+    ft = importlib.import_module('fhir_clini_assistant.fhir_tools')
+    logger.info("FHIR_TOOLS_EXPORTS=%s", sorted([a for a in dir(ft) if not a.startswith('_')])[:50])
+    snap_fn = getattr(ft, 'get_checklist_snapshot', None)
+    if callable(snap_fn):
+      snap0 = snap_fn(session_id)
+    else:
+      snap0 = {"exists": False}
+    logger.info("CHECKLIST_SNAP0 session_id=%s exists=%s counts=%s", session_id, snap0.get("exists"), snap0.get("counts"))
+    if not snap0.get("exists") or (snap0.get("counts") or {}).get("total", 0) == 0:
+      sel_area = "sintomas generales"
+      pid = SESSION_TO_PATIENT.get(session_id)
+      if pid:
+        try:
+          GetAreasAfectadasTool = getattr(ft, 'GetAreasAfectadasTool')
+          areas_tool = GetAreasAfectadasTool()
+          ar = await areas_tool.run_async(args={"patient": pid}, tool_context=None)
+          lst = (ar or {}).get("areas")
+          if isinstance(lst, list) and lst:
+            sel_area = lst[0]
+        except Exception as _:
+          pass
+      logger.info("CHECKLIST_INIT_ATTEMPT session_id=%s sel_area=%s has_tool=%s", session_id, sel_area, bool(getattr(ft, 'GetCriteriosChecklistTool', None)))
+      GetCriteriosChecklistTool = getattr(ft, 'GetCriteriosChecklistTool', None)
+      if GetCriteriosChecklistTool is None:
+        ft = importlib.reload(ft)
+        GetCriteriosChecklistTool = getattr(ft, 'GetCriteriosChecklistTool', None)
+      if GetCriteriosChecklistTool is None:
+        raise AttributeError("GetCriteriosChecklistTool not found in fhir_tools")
+      chk_tool = GetCriteriosChecklistTool()
+      chk_res = await chk_tool.run_async(args={"session_id": session_id, "area": sel_area}, tool_context=None)
+      logger.info("ANAMNESIS_CHECKLIST_LAZY_INIT session_id=%s area=%s total=%s", session_id, (chk_res or {}).get("area"), (chk_res or {}).get("total"))
+  except Exception as e:
+    logger.warning("ANAMNESIS_CHECKLIST_LAZY_INIT_FAIL: %s", e)
 
   # Append user message to transcript
+  SESSION_TO_TRANSCRIPT.setdefault(session_id, []).append(("user", req.message))
+
+  # Server-side structured extraction: update checklist from user text if checklist exists
   try:
-    SESSION_TO_TRANSCRIPT.setdefault(session_id, []).append(("user", req.message or ""))
+    ft2 = importlib.import_module('fhir_clini_assistant.fhir_tools')
+    snap_fn2 = getattr(ft2, 'get_checklist_snapshot', None)
+    snap_exists = bool(snap_fn2 and snap_fn2(session_id).get("exists"))
   except Exception:
-    pass
-
-  # Prefetch only on first turn
-  context_lines: list[str] = []
-  if just_created and req.patient_id:
+    snap_exists = False
+  if snap_exists:
     try:
-      from fhir_clini_assistant.fhir_tools import GetMotivoConsultaTool, GetPatientByIdTool
-      motivos_tool = GetMotivoConsultaTool()
-      motivos_res = await motivos_tool.run_async(args={"patient": req.patient_id}, tool_context=None)
-      motivos_list = motivos_res.get("motivos") or []
-      if motivos_list:
-        context_lines.append("Motivos de consulta detectados: " + ", ".join(motivos_list))
-      logger.info("CHAT_PREFETCH motivos_count=%d", len(motivos_list))
-    except Exception as e:
-      logger.warning("Prefetch motivos failed: %s", e)
-    try:
-      from fhir_clini_assistant.fhir_tools import GetPatientByIdTool
-      patient_tool = GetPatientByIdTool()
-      p = await patient_tool.run_async(args={"patient_id": req.patient_id}, tool_context=None)
-      nombre = p.get("nombre") or ""
-      if nombre:
-        context_lines.append(f"Paciente: {nombre}")
-      logger.info("CHAT_PREFETCH patient_name=%s", nombre or "(vacio)")
-    except Exception as e:
-      logger.warning("Prefetch patient failed: %s", e)
+      await _llm_extract_criterios(session_id, req.message or "")
+    except Exception as _:
+      pass
 
+  # Compose content from user (+ optional hidden checklist anchor)
   parts = [types.Part.from_text(text=req.message)]
-  # Incluir siempre contexto de paciente y sesión si está disponible
-  effective_pid = req.patient_id or SESSION_TO_PATIENT.get(session_id)
-  if effective_pid:
-    parts.append(types.Part.from_text(text=f"patient:{effective_pid}"))
-    parts.append(types.Part.from_text(text=f"patient={effective_pid}"))
-    parts.append(types.Part.from_text(text=f"patient_id={effective_pid}"))
-    parts.append(types.Part.from_text(text=f"Contexto: el ID del paciente es {effective_pid}."))
-  if session_id:
-    parts.append(types.Part.from_text(text=f"session_id={session_id}"))
-  if context_lines:
-    parts.append(types.Part.from_text(text=f"[contexto_inicial] {' | '.join(context_lines)}"))
+  try:
+    # Hidden session/patient info for tool calls
+    effective_pid = req.patient_id or SESSION_TO_PATIENT.get(session_id) or ""
+    parts.insert(0, types.Part.from_text(text=f"session_id={session_id}"))
+    if effective_pid:
+      parts.insert(1, types.Part.from_text(text=f"patient_id={effective_pid}"))
+    parts.insert(2, types.Part.from_text(text=f"agent_kind={agent_kind}"))
+    # Snapshot checklist for anchoring (not shown to user)
+    ft3 = importlib.import_module('fhir_clini_assistant.fhir_tools')
+    snap_fn3 = getattr(ft3, 'get_checklist_snapshot', None)
+    snap = snap_fn3(session_id) if callable(snap_fn3) else None
+    if snap and snap.get("exists"):
+      counts = snap.get("counts") or {}
+      area = snap.get("area") or ""
+      pending = ", ".join((snap.get("pending_items") or [])[:4])
+      anchor = f"[checklist_anchor] area={area} counts={counts} pending4=[{pending}]"
+      parts.insert(3, types.Part.from_text(text=anchor))
+  except Exception as _:
+    pass
 
   content = types.Content(role="user", parts=parts)
-  logger.debug("CHAT_SEND parts=%d just_created=%s", len(parts), just_created)
 
-  last_text = None
+  last_text = ""
   try:
-    async for event in runner.run_async(user_id=req.user_id, session_id=session_id, new_message=content):
-      if event.content and event.content.parts:
-        text = "".join([p.text or "" for p in event.content.parts if p.text])
-        if text:
-          last_text = text
+    async for event in active_runner.run_async(user_id=req.user_id, session_id=session_id, new_message=content):
+      text_candidate = None
+      if hasattr(event, "data") and getattr(event.data, "text", None):
+        text_candidate = event.data.text
+      elif hasattr(event, "content") and getattr(getattr(event, "content", None), "parts", None):
+        try:
+          text_candidate = "".join([(p.text or "") for p in event.content.parts if getattr(p, "text", None)])
+        except Exception:
+          text_candidate = None
+      if text_candidate:
+        last_text = text_candidate
   except Exception as e:
-    logger.exception("CHAT_ERROR: %s", e)
-    raise
+    logger.warning("CHAT_AGENT_FAIL: %s", e)
+
   # Append agent reply to transcript
+  SESSION_TO_TRANSCRIPT.setdefault(session_id, []).append(("agent", last_text))
+
+  # Execute any tool code emitted by agent
   try:
-    if last_text:
-      SESSION_TO_TRANSCRIPT.setdefault(session_id, []).append(("agent", last_text))
-  except Exception:
+    executed = await _execute_tool_code(session_id, last_text or "")
+    if executed:
+      logger.info("EXEC_TOOL_CODE_DONE session_id=%s", session_id)
+  except Exception as _:
     pass
 
-  # Fallback: si el usuario indica cierre, registrar ClinicalImpression y cerrar Encounter
-  def _looks_like_close(msg: str) -> bool:
-    m = (msg or "").strip().lower()
-    return any(
-      kw in m for kw in [
-        "es correcto", "todo correcto", "no tengo mas dudas", "no tengo más dudas", "no, gracias", "no gracias", "podemos terminar", "cerrar consulta", "fin de la consulta"
-      ]
-    )
-  if _looks_like_close(req.message):
-    try:
-      from fhir_clini_assistant.fhir_tools import CreateClinicalImpressionTool, UpdateEncounterStatusTool
-      effective_pid = req.patient_id or SESSION_TO_PATIENT.get(session_id)
-      # Generar resumen de toda la sesión con el agente
-      summary_text = None
-      try:
-        # Construir prompt con el transcript
-        lines = []
-        for role, text in (SESSION_TO_TRANSCRIPT.get(session_id) or [])[-100:]:  # limitar tamaño
-          if not text:
-            continue
-          prefix = "Paciente" if role == "user" else "Agente"
-          lines.append(f"{prefix}: {text}")
-        transcript_blob = "\n".join(lines)
-        instr = (
-          "Genera un resumen de anamnesis clínicamente relevante en 6-10 líneas, claro y conciso, "
-          "sin llamadas a herramientas, basado estrictamente en la conversación. "
-          "Estructura: motivo de consulta; HPI; antecedentes y hábitos; hallazgos relevantes; cierre."
-        )
-        parts_sum = [
-          types.Part.from_text(text="[tarea] resumen_anamnesis"),
-          types.Part.from_text(text=instr),
-          types.Part.from_text(text="[conversacion]"),
-          types.Part.from_text(text=transcript_blob),
-        ]
-        content_sum = types.Content(role="user", parts=parts_sum)
-        sum_text = None
-        async for ev in runner.run_async(user_id=req.user_id, session_id=session_id, new_message=content_sum):
-          if ev.content and ev.content.parts:
-            t = "".join([p.text or "" for p in ev.content.parts if p.text])
-            if t:
-              sum_text = t
-        summary_text = (sum_text or "").strip()
-      except Exception as e:
-        logger.warning("CHAT_CLOSE_SUMMARY_GEN_FAIL: %s", e)
-      if not summary_text:
-        summary_text = (last_text or "").strip() or "Anamnesis registrada por el asistente clínico."
-      # Crear ClinicalImpression
-      ci_tool = CreateClinicalImpressionTool()
-      ci_args = {"patient_id": effective_pid, "session_id": session_id, "summary": summary_text}
-      ci_res = await ci_tool.run_async(args=ci_args, tool_context=None)
-      logger.info("CHAT_CLOSE CI_CREATED id=%s", (ci_res or {}).get("clinical_impression_id"))
-      # Cerrar Encounter
-      upd_tool = UpdateEncounterStatusTool()
-      upd_res = await upd_tool.run_async(args={"session_id": session_id, "status": "completed"}, tool_context=None)
-      logger.info("CHAT_CLOSE ENCOUNTER_COMPLETED id=%s", (upd_res or {}).get("encounter_id"))
-      # Añadir confirmación al mensaje final si no hubo respuesta textual
-      if not last_text:
-        last_text = "He registrado tu anamnesis y cerrado la consulta. Gracias por tu tiempo."
-    except Exception as e:
-      logger.warning("CHAT_CLOSE_FALLBACK_FAIL: %s", e)
+  # Emit DEBUG with current checklist snapshot after agent reply
+  try:
+    ft4 = importlib.import_module('fhir_clini_assistant.fhir_tools')
+    snap_fn4 = getattr(ft4, 'get_checklist_snapshot', None)
+    s = snap_fn4(session_id) if callable(snap_fn4) else None
+    if s:
+      logger.info("ANAMNESIS_CHECKLIST session_id=%s area=%s counts=%s pending=%s", session_id, s.get("area"), s.get("counts"), ", ".join(s.get("pending_items") or [])[:256])
+  except Exception as _:
+    pass
 
-  logger.info("CHAT_OK reply_len=%d", len(last_text or ""))
-  return {"reply": last_text, "session_id": session_id}
+  # Server-side fallback: si el agente no cierra, intenta generar ClinicalImpression
+  try:
+    # Triggers: explicit close phrases, presence of summary, or user's confirmation
+    lower_last = (last_text or "").lower()
+    # Strip tool call lines before extracting summary
+    stripped_text = _strip_tool_calls(last_text or "")
+    summary_text = _extract_summary_from_text(stripped_text)
+    user_confirm = any((msg or "").lower().strip() in ("es correcto", "correcto") for role, msg in (SESSION_TO_TRANSCRIPT.get(session_id) or [])[-3:] if role == "user")
+    trigger_close = any(k in lower_last for k in ["cerramos", "terminamos", "fin de la consulta", "con esto cerramos", "consulta ha finalizado"]) or summary_text is not None or user_confirm
+    if trigger_close:
+      # Generar resumen: preferir el extraído del mensaje; si no, pedir al modelo con todo el transcript
+      resumen = summary_text
+      if not resumen:
+        transcript = SESSION_TO_TRANSCRIPT.get(session_id) or []
+        if transcript:
+          lines = []
+          for role, text in transcript:
+            if not text:
+              continue
+            prefix = "Paciente" if role == "user" else "Agente"
+            # Strip potential tool calls from transcript lines too
+            lines.append(f"{prefix}: {_strip_tool_calls(text)}")
+          joined = "\n".join(lines)
+          system_sum = types.Content(role="system", parts=[types.Part.from_text(text=(
+            "Eres un asistente clínico. Resume en 8-14 líneas la anamnesis completa, "
+            "destacando motivo de consulta, antecedentes relevantes, hallazgos reportados, y factores de riesgo clave. "
+            "Escribe en español, redacta con oraciones completas y sin viñetas."
+          ))])
+          user_sum = types.Content(role="user", parts=[types.Part.from_text(text=joined)])
+          try:
+            async for ev in active_runner.run_async(user_id=req.user_id, session_id=session_id, new_message=system_sum):
+              pass
+            async for ev in active_runner.run_async(user_id=req.user_id, session_id=session_id, new_message=user_sum):
+              if hasattr(ev, "data") and getattr(ev.data, "text", None):
+                resumen = ev.data.text
+              elif hasattr(ev, "content") and getattr(getattr(ev, "content", None), "parts", None):
+                try:
+                  resumen = "".join([(p.text or "") for p in ev.content.parts if getattr(p, "text", None)])
+                except Exception:
+                  resumen = None
+          except Exception:
+            resumen = None
+      # Crear ClinicalImpression y completar Encounter
+      from fhir_clini_assistant.fhir_tools import CreateClinicalImpressionTool, UpdateEncounterStatusTool
+      ci_tool = CreateClinicalImpressionTool()
+      up_tool = UpdateEncounterStatusTool()
+      enc_id = SESSION_TO_ENCOUNTER.get(session_id)
+      pid = SESSION_TO_PATIENT.get(session_id)
+      if pid and (enc_id or session_id) and resumen:
+        try:
+          # Strip lingering tool-calls from resumen
+          resumen_clean = _strip_tool_calls(resumen)
+          args_ci = {"patient_id": pid, "summary": resumen_clean}
+          if enc_id:
+            args_ci["encounter_id"] = enc_id
+          else:
+            args_ci["session_id"] = session_id
+          ci_res = await ci_tool.run_async(args=args_ci, tool_context=None)
+          logger.info("CI_CREATE_OK_FALLBACK session_id=%s res=%s", session_id, (ci_res or {}))
+          if enc_id:
+            await up_tool.run_async(args={"encounter_id": enc_id, "status": "completed"}, tool_context=None)
+          else:
+            await up_tool.run_async(args={"session_id": session_id, "status": "completed"}, tool_context=None)
+        except Exception as e:
+          logger.warning("CI_CREATE_FAIL_FALLBACK session_id=%s err=%s", session_id, e)
+  except Exception as e:
+    logger.warning("CHAT_FALLBACK_CLOSE_FAIL: %s", e)
+
+  return {"reply": last_text or ""}
 
 
 # ========== WebRTC (Vertex Live API) ==========

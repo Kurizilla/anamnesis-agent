@@ -71,6 +71,14 @@ Flujo sugerido (adaptarlo según la conversación):
 - Hallazgos objetivos disponibles (signos vitales/laboratorios/observaciones recientes).
 - Resumen y verificación con el/la paciente.
 
+Factores de riesgo (preguntas dirigidas cuando faltan datos):
+- Al inicio de la anamnesis y/o cuando sea pertinente, llama a score_riesgo para conocer los valores disponibles en FHIR. Interpreta los campos del resultado y, si alguno falta (None), realiza preguntas específicas al paciente para completarlos. Pregunta de uno en uno, con lenguaje simple, confirma y refleja el dato antes de continuar.
+- Si falta IMC (imc.valor es None): pregunta altura y peso. Acepta unidades comunes (cm/m y kg/lb); convierte internamente y calcula IMC = peso(kg) / (altura(m))^2. Si el/la paciente no sabe una de las dos, intenta aproximar (p. ej., “¿sabe su peso aproximado?”).
+- Si falta cintura_cm.valor: pregunta “¿Podrías decirme tu medida de cintura en centímetros a la altura del ombligo?” y ofrece ayuda para medir si no la conoce.
+- Si falta fumar.estado: pregunta de manera directa y respetuosa si es fumador/a activo/a en la actualidad; respuesta esperada: sí/no. Si es sí y es útil, pide una breve caracterización (años fumando, cigarrillos por día), sin insistir.
+- Si faltan antecedentes familiares de hipertensión o diabetes (antecedentes_familiares.primer_grado_riesgo es None o 0 sin coincidencias): pregunta si madre o padre tienen “hipertensión” o “diabetes tipo 2”.
+- Regla: no hagas suposiciones. Si el/la paciente desconoce algún dato, márcalo como no disponible y continúa con la entrevista.
+
 Herramientas disponibles (utilízalas cuando aporten precisión):
 - get_motivo_consulta: obtiene motivos de consulta y cuestionarios asociados desde el triage más reciente (FHIR).
 - get_areas_afectadas: obtiene áreas afectadas del triage (ClinicalImpression con protocolo affected-areas).
@@ -119,28 +127,29 @@ root_agent = Agent(
     description='Agente de consulta clínica cara al paciente con acceso a FHIR.',
     instruction=_INSTRUCTION,
     tools=[
-      # Priorizar herramientas de cierre/escritura y claves de flujo
-      CreateClinicalImpressionTool(),
-      UpdateEncounterStatusTool(),
-      CreateRiskAssessmentTool(),
-      CreateEncounterTool(),
-      ScoreRiesgoTool(),
-      GetMotivoConsultaTool(),
-      GetAreasAfectadasTool(),
-      GetPatientByIdTool(),
-      GetObservacionesTool(),
-      GetConditionsTool(),
-      GetAllergiesTool(),
-      GetMedicationRequestsTool(),
-      GetFamilyMemberHistoryTool(),
-      GetVariablesPrevencionTool(),
-      GetPatologicosPersonalesTool(),
-      GetDeterminantesSocioambientalesTool(),
-      GetDisponibilidadRecursosTool(),
-      GetPresentacionPacienteTool(),
-      GetResumenHistorialMedicoTool(),
-      ScanDatosEspecificosTool(),
-      # Dejar OpenAPI toolset al final para no consumir el presupuesto de funciones de AFC
-      _openapi_toolset,
+        # Priorizar cierre/escritura
+        CreateClinicalImpressionTool(),
+        UpdateEncounterStatusTool(),
+        CreateRiskAssessmentTool(),
+        CreateEncounterTool(),
+        # Consulta
+        ScoreRiesgoTool(),
+        GetMotivoConsultaTool(),
+        GetAreasAfectadasTool(),
+        GetPatientByIdTool(),
+        GetObservacionesTool(),
+        GetConditionsTool(),
+        GetAllergiesTool(),
+        GetMedicationRequestsTool(),
+        GetFamilyMemberHistoryTool(),
+        GetVariablesPrevencionTool(),
+        GetPatologicosPersonalesTool(),
+        GetDeterminantesSocioambientalesTool(),
+        GetDisponibilidadRecursosTool(),
+        GetPresentacionPacienteTool(),
+        GetResumenHistorialMedicoTool(),
+        ScanDatosEspecificosTool(),
+        # OpenAPI toolset al final
+        _openapi_toolset,
     ],
 ) 

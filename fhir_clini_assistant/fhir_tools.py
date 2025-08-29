@@ -1941,13 +1941,14 @@ class CreateEncounterTool(BaseTool):
     - status: in-progress
     - class: Coding VR (virtual)
     - subject: reference Patient/{id}
-    - extension: anamnesis-agent/created-datetime con fecha actual UTC
+    - extension: created-datetime con fecha actual UTC (URL según propósito)
     - identifier: system propio con session_id
 
   Args:
     patient_id (str): ID del paciente (con o sin prefijo "Patient/").
     session_id (str, opcional): ID de sesión a correlacionar en identifier.
     created_datetime (str, opcional): ISO8601 para valueDateTime. Si no se provee, se usa ahora en UTC.
+    purpose (str, opcional): "anamnesis" (predeterminado) o "risk" para diferenciar el origen del Encounter.
   Retorna:
     dict: { "encounter_id": str, "status": str }
   """
@@ -1956,7 +1957,8 @@ class CreateEncounterTool(BaseTool):
     super().__init__(
         name="create_encounter",
         description=(
-            "Crea un Encounter 'in-progress' con class=VR (virtual) y subject=Patient/{id}."
+            "Crea un Encounter 'in-progress' con class=VR (virtual) y subject=Patient/{id}. "
+            "Usa 'purpose' opcional ('anamnesis'|'risk') para etiquetar la extension created-datetime."
         ),
     )
     self._session: Optional[AuthorizedSession] = None
@@ -1973,6 +1975,7 @@ class CreateEncounterTool(BaseTool):
     # Fecha de creación (UTC)
     created_dt: str = args.get("created_datetime") or (datetime.utcnow().isoformat() + "Z")
     session_id: Optional[str] = args.get("session_id")
+    purpose: str = str(args.get("purpose") or "anamnesis").strip().lower()
 
     if not self._session:
       self._session = _new_authorized_session()
@@ -1988,6 +1991,12 @@ class CreateEncounterTool(BaseTool):
         }
       ]
 
+    # Extension URL según origen
+    if purpose == "risk":
+      ext_url = "http://goes.gob.sv/fhir/extensions/risk-agent/created-datetime"
+    else:
+      ext_url = "http://goes.gob.sv/fhir/extensions/anamnesis-agent/created-datetime"
+
     body = {
       "resourceType": "Encounter",
       "status": "in-progress",
@@ -2001,7 +2010,7 @@ class CreateEncounterTool(BaseTool):
       },
       "extension": [
         {
-          "url": "http://goes.gob.sv/fhir/extensions/anamnesis-agent/created-datetime",
+          "url": ext_url,
           "valueDateTime": created_dt,
         }
       ],
@@ -2437,3 +2446,230 @@ class UpdateEncounterStatusTool(BaseTool):
 
     logger.info("ENCOUNTER_UPDATE ok id=%s status=%s", encounter_id, status)
     return {"encounter_id": encounter_id, "status": status}
+
+
+class UpdateCriterioEstadoTool(BaseTool):
+  """Actualiza el estado/valor de un criterio en el checklist de la sesión.
+
+  Args:
+    session_id (str): ID de sesión
+    criterio (str): nombre del criterio (case-insensitive)
+    status (str): pending | asked | answered
+    value (str, opcional): valor libre capturado para el criterio
+  Retorna:
+    dict: { "area": str, "updated": bool, "counts": {pending, asked, answered, total} }
+  """
+
+  def __init__(self):
+    super().__init__(
+        name="update_criterio_estado",
+        description=(
+            "Marca un criterio del checklist como asked/answered y guarda valor si aplica."
+        ),
+    )
+
+  async def run_async(self, *, args: dict[str, Any], tool_context: ToolContext) -> Any:
+    session_id = (args.get("session_id") or "").strip()
+    criterio = (args.get("criterio") or "").strip()
+    status = (args.get("status") or "").strip().lower()
+    value = args.get("value")
+    if not session_id or not criterio or status not in {"pending", "asked", "answered"}:
+      raise types.FunctionCallError(code="INVALID_ARGUMENT", message="session_id, criterio y status válidos son requeridos")
+
+    data = _CHECKLISTS.get(session_id)
+    if not data:
+      # si no existe, crear desde default
+      init = GetCriteriosChecklistTool()
+      await init.run_async(args={"session_id": session_id}, tool_context=None)  # type: ignore
+      data = _CHECKLISTS.get(session_id)
+
+    items = data.get("items") if data else []
+    updated = False
+    low = criterio.lower()
+    for it in items:
+      if str(it.get("name") or "").lower() == low:
+        it["status"] = status
+        if value is not None:
+          it["value"] = value
+        updated = True
+        break
+
+    # Debug log for monitoring updates
+    try:
+      import logging
+      logging.getLogger(__name__).info(
+        "CHECKLIST_UPDATE session_id=%s area=%s criterio=%s status=%s value=%s updated=%s",
+        session_id, (data.get("area") if data else None), criterio, status, (value if value is not None else ""), updated,
+      )
+    except Exception:
+      pass
+
+    snap = get_checklist_snapshot(session_id)
+    return {"area": data.get("area") if data else None, "updated": updated, "counts": snap.get("counts")}
+
+# ====== Anamnesis checklist (in-memory) [guarded append] ======
+try:
+  _CHECKLISTS  # type: ignore
+except NameError:
+  _CHECKLISTS = {}
+
+try:
+  get_checklist_snapshot  # type: ignore
+except NameError:
+  def get_checklist_snapshot(session_id: str) -> dict:
+    data = _CHECKLISTS.get(session_id)
+    if not data:
+      return {"exists": False, "area": None, "counts": {"pending": 0, "asked": 0, "answered": 0, "total": 0}, "pending_items": []}
+    items = data.get("items") or []
+    counts = {"pending": 0, "asked": 0, "answered": 0, "total": len(items)}
+    pending_names = []
+    for it in items:
+      st = (it.get("status") or "pending").lower()
+      if st == "answered":
+        counts["answered"] += 1
+      elif st == "asked":
+        counts["asked"] += 1
+      else:
+        counts["pending"] += 1
+        name = it.get("name")
+        if name:
+          pending_names.append(name)
+    return {"exists": True, "area": data.get("area"), "counts": counts, "pending_items": pending_names}
+
+try:
+  GetCriteriosChecklistTool  # type: ignore
+except NameError:
+  class GetCriteriosChecklistTool(BaseTool):
+    """Crea/lee el checklist de criterios de anamnesis para la sesión.
+
+    Si no existe, lo crea a partir de data/criterios.py (o del área "sintomas generales").
+
+    Args:
+      session_id (str): ID de la sesión.
+      area (str, opcional): área base para el checklist.
+    Retorna:
+      dict: { "area": str, "items": [ {"name": str, "status": str, "value": str|None } ], "completed": int, "total": int }
+    """
+
+    def __init__(self):
+      super().__init__(
+          name="get_criterios_checklist",
+          description="Crea/lee el checklist de criterios de una sesión para guiar la anamnesis.",
+      )
+
+    async def run_async(self, *, args: dict[str, Any], tool_context: ToolContext) -> Any:
+      session_id = (args.get("session_id") or "").strip()
+      area = (args.get("area") or "").strip()
+      if not session_id:
+        raise ValueError("session_id requerido")
+
+      existing = _CHECKLISTS.get(session_id)
+      if existing and (not area or area.lower() == str(existing.get("area") or "").lower()):
+        items = existing.get("items") or []
+        completed = sum(1 for it in items if (it.get("status") or "pending").lower() == "answered")
+        return {"area": existing.get("area"), "items": items, "completed": completed, "total": len(items)}
+
+      try:
+        from data.criterios import CRITERIOS_POR_AREA  # type: ignore
+      except Exception as e:
+        import logging, sys, os, importlib.util
+        logging.getLogger(__name__).warning("CRITERIOS_IMPORT_FAIL: %s", e)
+        # Fallback 1: ensure '/app' on sys.path and retry
+        added = False
+        if '/app' not in sys.path:
+          sys.path.insert(0, '/app')
+          added = True
+        try:
+          from data.criterios import CRITERIOS_POR_AREA  # type: ignore
+        except Exception as e2:
+          logging.getLogger(__name__).warning("CRITERIOS_IMPORT_FAIL_RETRY: %s (added_sys_path=%s)", e2, added)
+          # Fallback 2: load by file path
+          candidate = os.getenv('CRITERIOS_FILE', '/app/data/criterios.py')
+          try:
+            spec = importlib.util.spec_from_file_location("_criterios_dynamic", candidate)
+            if spec and spec.loader:
+              mod = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(mod)  # type: ignore
+              CRITERIOS_POR_AREA = getattr(mod, 'CRITERIOS_POR_AREA')  # type: ignore
+            else:
+              raise FileNotFoundError(f"spec not created for {candidate}")
+          except Exception as e3:
+            logging.getLogger(__name__).error("CRITERIOS_LOAD_FILE_FAIL path=%s err=%s", candidate, e3)
+            raise
+
+      sel_area = area or "sintomas generales"
+      key = None
+      if sel_area in CRITERIOS_POR_AREA:
+        key = sel_area
+      else:
+        low = sel_area.lower()
+        for k in CRITERIOS_POR_AREA.keys():
+          if str(k).lower() == low:
+            key = k
+            break
+      if key is None:
+        key = "sintomas generales"
+
+      lst = CRITERIOS_POR_AREA.get(key) or []
+      items = []
+      for c in lst:
+        if isinstance(c, dict) and c.get("criterio"):
+          items.append({"name": c.get("criterio"), "status": "pending", "value": None})
+
+      data = {"area": key, "items": items}
+      _CHECKLISTS[session_id] = data
+      try:
+        import logging
+        logging.getLogger(__name__).info("CHECKLIST_INIT session_id=%s area=%s criterios=%s", session_id, key, ", ".join([i.get("name") for i in items]))
+      except Exception:
+        pass
+      return {"area": key, "items": items, "completed": 0, "total": len(items)}
+
+try:
+  UpdateCriterioEstadoTool  # type: ignore
+except NameError:
+  class UpdateCriterioEstadoTool(BaseTool):
+    """Actualiza el estado/valor de un criterio en el checklist de la sesión."""
+
+    def __init__(self):
+      super().__init__(
+          name="update_criterio_estado",
+          description="Marca un criterio del checklist como asked/answered y guarda valor si aplica.",
+      )
+
+    async def run_async(self, *, args: dict[str, Any], tool_context: ToolContext) -> Any:
+      session_id = (args.get("session_id") or "").strip()
+      criterio = (args.get("criterio") or "").strip()
+      status = (args.get("status") or "").strip().lower()
+      value = args.get("value")
+      if not session_id or not criterio or status not in {"pending", "asked", "answered"}:
+        raise types.FunctionCallError(code="INVALID_ARGUMENT", message="session_id, criterio y status válidos son requeridos")
+
+      data = _CHECKLISTS.get(session_id)
+      if not data:
+        init = GetCriteriosChecklistTool()
+        await init.run_async(args={"session_id": session_id}, tool_context=None)  # type: ignore
+        data = _CHECKLISTS.get(session_id)
+
+      items = data.get("items") if data else []
+      updated = False
+      low = criterio.lower()
+      for it in items:
+        if str(it.get("name") or "").lower() == low:
+          it["status"] = status
+          if value is not None:
+            it["value"] = value
+          updated = True
+          break
+
+      try:
+        import logging
+        logging.getLogger(__name__).info(
+          "CHECKLIST_UPDATE session_id=%s area=%s criterio=%s status=%s value=%s updated=%s",
+          session_id, (data.get("area") if data else None), criterio, status, (value if value is not None else ""), updated,
+        )
+      except Exception:
+        pass
+
+      snap = get_checklist_snapshot(session_id)
+      return {"area": data.get("area") if data else None, "updated": updated, "counts": snap.get("counts")}

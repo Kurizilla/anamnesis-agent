@@ -16,6 +16,15 @@ import unicodedata
 
 logger = logging.getLogger(__name__)
 
+# Compatibility shim: ensure types.FunctionCallError exists even if SDK lacks it
+if not hasattr(types, "FunctionCallError"):
+  class _FunctionCallError(Exception):
+    def __init__(self, code: Optional[str] = None, message: str = ""):
+      super().__init__(message)
+      self.code = code
+      self.message = message
+  types.FunctionCallError = _FunctionCallError  # type: ignore
+
 
 def _build_fhir_store_base_url() -> str:
   project = os.getenv("FHIR_PROJECT")
@@ -2219,12 +2228,26 @@ class CreateRiskAssessmentTool(BaseTool):
 
     basis_refs = []
     # Evidence: preferir evidencia explícita si se pasa; si no, resolver automáticamente
+    prob_decimal = None
     if isinstance(evidence, dict):
       qr_id = evidence.get('questionnaire_response_id')
       if qr_id:
         basis_refs.append({"reference": f"QuestionnaireResponse/{qr_id}"})
       obs_map = (evidence.get('observations') or {}) if isinstance(evidence.get('observations'), dict) else {}
-      for oid in [obs_map.get('imc'), obs_map.get('fpg'), obs_map.get('hba1c'), obs_map.get('trigliceridos'), obs_map.get('hdl')]:
+      # Contabilizar cobertura de variables (QR + observaciones clave)
+      present = 1 if qr_id else 0
+      total = 1
+      present += 1 if (obs_map.get('imc')) else 0
+      present += 1 if (obs_map.get('fpg')) else 0
+      present += 1 if (obs_map.get('hba1c') or obs_map.get('a1c')) else 0
+      present += 1 if (obs_map.get('trigliceridos') or obs_map.get('trig')) else 0
+      present += 1 if (obs_map.get('hdl')) else 0
+      total += 5
+      try:
+        prob_decimal = round(max(0.0, min(1.0, present / float(total))), 2)
+      except Exception:
+        prob_decimal = None
+      for oid in [obs_map.get('imc'), obs_map.get('fpg'), obs_map.get('hba1c') or obs_map.get('a1c'), obs_map.get('trigliceridos') or obs_map.get('trig'), obs_map.get('hdl')]:
         if oid:
           basis_refs.append({"reference": f"Observation/{oid}"})
     else:
@@ -2233,12 +2256,36 @@ class CreateRiskAssessmentTool(BaseTool):
       if qr_id:
         basis_refs.append({"reference": f"QuestionnaireResponse/{qr_id}"})
       obs_ids = self._pick_latest_obs_ids(patient_id)
+      # Contabilizar cobertura de variables (QR + observaciones clave)
+      present = 1 if qr_id else 0
+      total = 1
+      present += 1 if (obs_ids.get('imc')) else 0
+      present += 1 if (obs_ids.get('fpg')) else 0
+      present += 1 if (obs_ids.get('a1c')) else 0
+      present += 1 if (obs_ids.get('trig')) else 0
+      present += 1 if (obs_ids.get('hdl')) else 0
+      total += 5
+      try:
+        prob_decimal = round(max(0.0, min(1.0, present / float(total))), 2)
+      except Exception:
+        prob_decimal = None
       for key in ["imc", "fpg", "a1c", "trig", "hdl"]:
         oid = obs_ids.get(key)
         if oid:
           basis_refs.append({"reference": f"Observation/{oid}"})
 
     # Construir RiskAssessment
+    prediction_entry = {
+      "outcome": {
+        "coding": [
+          {"system": "http://goes.gob.sv/fhir/codeable-concept/risk-assessment-outcome", "code": outcome}
+        ]
+      },
+      "rationale": rationale,
+    }
+    if prob_decimal is not None:
+      prediction_entry["probabilityDecimal"] = prob_decimal
+
     body = {
       "resourceType": "RiskAssessment",
       "status": "final",
@@ -2249,16 +2296,7 @@ class CreateRiskAssessmentTool(BaseTool):
           {"system": "http://goes.gob.sv/fhir/codeable-concept/risk-assessment-method", "code": "early-warning"}
         ]
       },
-      "prediction": [
-        {
-          "outcome": {
-            "coding": [
-              {"system": "http://goes.gob.sv/fhir/codeable-concept/risk-assessment-outcome", "code": outcome}
-            ]
-          },
-          "rationale": rationale,
-        }
-      ],
+      "prediction": [prediction_entry],
     }
     if encounter_id:
       body["encounter"] = {"reference": f"Encounter/{encounter_id}"}

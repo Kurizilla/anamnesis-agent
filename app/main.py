@@ -17,11 +17,21 @@ from google import genai
 from google.genai import types as genai_types
 import io, wave
 import uuid, json, base64
+import hashlib, time
 from fastapi import WebSocket, WebSocketDisconnect
 from fhir_clini_assistant.agent import _INSTRUCTION as LIVE_SYSTEM_INSTRUCTION
 import importlib
 import re
 import ast
+from app.config import VISIBLE_DELIM, JSON_DELIM, CLOSE_STATUS, SANITIZE_TOKENS, USE_FHIR_FALLBACK, USE_LEGACY_EXEC
+from app.services.closure import parse_closing_blocks as svc_parse_closing_blocks, sanitize_visible_markdown as svc_sanitize_visible
+from app.services.fhir import create_clinical_impression as fhir_create_ci, update_encounter_status as fhir_update_enc_status, rest_finish_encounter as fhir_rest_finish
+from app.services.checklist import llm_extract_criterios as svc_llm_extract_criterios
+from app.routes.live import router as live_router
+from app.routes.live_sdk import router as live_sdk_router
+from app.routes.text import router as text_router
+from app.services.bootstrap import prefetch as svc_prefetch, create_encounter as svc_create_encounter, build_context_lines as svc_build_ctx, build_kickoff_text as svc_kickoff
+from app.services.chat import build_user_parts_texts as svc_build_user_parts
 
 logging.basicConfig(
   level=getattr(logging, os.getenv("LOGLEVEL", "INFO")),
@@ -51,87 +61,9 @@ AGENT_NAME = os.getenv("AGENT_NAME", "fhir_clini_assistant")
 SESSION_TO_PATIENT: dict[str, str] = {}
 SESSION_TO_ENCOUNTER: dict[str, str] = {}
 SESSION_TO_TRANSCRIPT: dict[str, list[tuple[str, str]]] = {}
+ENCOUNTER_PLAN_HASHES: dict[str, set[str]] = {}
 
-# Live audio session manager (SDK-based)
-class _LiveSessionState:
-  def __init__(self, session_id: str):
-    self.id = session_id
-    self.in_q: asyncio.Queue = asyncio.Queue()  # items: {"type":"text"|"audio","data":..., "mime":...}
-    self.out_q: asyncio.Queue = asyncio.Queue() # items sent to SSE as dict
-    self.worker: asyncio.Task | None = None
-    self.closed: bool = False
-
-LIVE_SESSIONS: dict[str, _LiveSessionState] = {}
-
-async def _live_worker(state: _LiveSessionState):
-  model_id = os.getenv("LIVE_MODEL", "gemini-live-2.5-flash-preview-native-audio")
-  client = genai.Client()
-  cfg = genai_types.LiveConnectConfig(
-    response_modalities=["AUDIO"],
-    input_audio_transcription=genai_types.AudioTranscriptionConfig(),
-    output_audio_transcription=genai_types.AudioTranscriptionConfig(),
-    speech_config=genai_types.SpeechConfig(
-      voice_config=genai_types.VoiceConfig(
-        prebuilt_voice_config=genai_types.PrebuiltVoiceConfig(voice_name="Kore")
-      )
-    ),
-    system_instruction=genai_types.Content(role="system", parts=[genai_types.Part(text=LIVE_SYSTEM_INSTRUCTION)]),
-  )
-  try:
-    async with client.aio.live.connect(model=model_id, config=cfg) as session:
-      async def _sender():
-        while True:
-          item = await state.in_q.get()
-          if item is None:
-            break
-          try:
-            if item.get("type") == "text":
-              text = item.get("data") or ""
-              await session.send_client_content(
-                turns=genai_types.Content(role="user", parts=[genai_types.Part(text=text)]),
-                turn_complete=True,
-              )
-            elif item.get("type") == "audio":
-              data = item.get("data") or b""
-              mime = item.get("mime") or "audio/pcm;rate=16000"
-              await session.send_realtime_input(audio=genai_types.Blob(data=data, mime_type=mime))
-          except Exception as e:
-            await state.out_q.put({"event": "error", "message": f"sender_error: {e}"})
-
-      async def _receiver():
-        async for message in session.receive():
-          try:
-            sc = getattr(message, "server_content", None)
-            if not sc:
-              continue
-            # Transcriptions
-            if getattr(sc, "input_transcription", None) and getattr(sc.input_transcription, "text", None):
-              await state.out_q.put({"event": "input_transcription", "text": sc.input_transcription.text})
-            if getattr(sc, "output_transcription", None) and getattr(sc.output_transcription, "text", None):
-              await state.out_q.put({"event": "output_transcription", "text": sc.output_transcription.text})
-            # Audio chunks from model
-            mt = getattr(sc, "model_turn", None)
-            if mt and getattr(mt, "parts", None):
-              for p in mt.parts:
-                if getattr(p, "inline_data", None) and getattr(p.inline_data, "data", None):
-                  b = p.inline_data.data  # raw PCM int16 24kHz
-                  await state.out_q.put({
-                    "event": "audio_chunk",
-                    "mime": "audio/pcm;rate=24000",
-                    "data": base64.b64encode(b).decode("ascii"),
-                  })
-          except Exception as e:
-            await state.out_q.put({"event": "error", "message": f"receiver_error: {e}"})
-        # End of stream
-        await state.out_q.put({"event": "closed"})
-
-      send_task = asyncio.create_task(_sender())
-      recv_task = asyncio.create_task(_receiver())
-      await asyncio.gather(send_task, recv_task)
-  except Exception as e:
-    await state.out_q.put({"event": "error", "message": f"live_connect_error: {e}"})
-  finally:
-    state.closed = True
+# Removed inline Live session manager; handled in app.routes.live_sdk
 
 loader = AgentLoader(agents_dir=AGENTS_DIR)
 logger.info("AGENTS_DIR=%s AGENT_NAME=%s", AGENTS_DIR, AGENT_NAME)
@@ -180,19 +112,26 @@ try:
 except Exception as e:
   logger.warning("TOOLS_LIST_ERROR: %s", e)
 
-app = FastAPI(title="Clini Assistant API")
+from app.api import app
 
 # Allow Streamlit UI (8501) to call this backend
-app.add_middleware(
-  CORSMiddleware,
-  allow_origins=[
-    "http://localhost:8501",
-    "http://127.0.0.1:8501",
-  ],
-  allow_credentials=True,
-  allow_methods=["*"],
-  allow_headers=["*"],
-)
+
+app.include_router(live_router)
+app.include_router(live_sdk_router)
+app.include_router(text_router)
+
+# Expose shared state for routers
+app.state.SESSION_TO_PATIENT = SESSION_TO_PATIENT
+app.state.SESSION_TO_ENCOUNTER = SESSION_TO_ENCOUNTER
+app.state.SESSION_TO_TRANSCRIPT = SESSION_TO_TRANSCRIPT
+app.state.ENCOUNTER_PLAN_HASHES = ENCOUNTER_PLAN_HASHES
+app.state.LIVE_SESSIONS = {} # Removed LIVE_SESSIONS
+app.state.live_runner = live_runner
+app.state.live_agent = live_agent
+app.state.runner = runner
+app.state.anamnesis_runner = anamnesis_runner
+app.state.risk_runner = risk_runner
+
 
 class ChatRequest(BaseModel):
   user_id: str
@@ -251,39 +190,15 @@ async def bootstrap(req: BootstrapRequest):
   session_id = session.id
   # Inicializar transcript
   SESSION_TO_TRANSCRIPT[session_id] = []
-  # Prefetch in parallel
-  from fhir_clini_assistant.fhir_tools import GetPatientByIdTool, GetMotivoConsultaTool, GetAreasAfectadasTool
-  patient_tool = GetPatientByIdTool()
-  motivos_tool = GetMotivoConsultaTool()
-  areas_tool = GetAreasAfectadasTool()
-  async def _safe(coro):
-    try:
-      return await coro
-    except Exception as e:
-      logger.warning("BOOTSTRAP_PREFETCH_FAIL: %s", e)
-      return None
-  patient_task = _safe(patient_tool.run_async(args={"patient_id": req.patient_id}, tool_context=None))
-  motivos_task = _safe(motivos_tool.run_async(args={"patient": req.patient_id}, tool_context=None))
-  areas_task = _safe(areas_tool.run_async(args={"patient": req.patient_id}, tool_context=None))
-  # Solo calcular score de riesgo en el agente de riesgo
-  score_res = None
-  if agent_kind == "risk":
-    from fhir_clini_assistant.fhir_tools import ScoreRiesgoTool
-    score_tool = ScoreRiesgoTool()
-    score_task = _safe(score_tool.run_async(args={"patient": req.patient_id}, tool_context=None))
-    patient_res, motivos_res, areas_res, score_res = await asyncio.gather(patient_task, motivos_task, areas_task, score_task)
-  else:
-    patient_res, motivos_res, areas_res = await asyncio.gather(patient_task, motivos_task, areas_task)
+
+  # Prefetch via service
+  patient_res, motivos_res, areas_res, score_res = await svc_prefetch(req.patient_id, agent_kind)
 
   # Crear Encounter in-progress para esta sesión (con propósito según agente)
   encounter_id = None
   try:
-    from fhir_clini_assistant.fhir_tools import CreateEncounterTool
-    enc_tool = CreateEncounterTool()
     purpose = "risk" if agent_kind == "risk" else "anamnesis"
-    enc_res = await enc_tool.run_async(args={"patient_id": req.patient_id, "session_id": session_id, "purpose": purpose}, tool_context=None)
-    encounter_id = (enc_res or {}).get("encounter_id")
-    # Mapear sesión a encounter y patient para usos posteriores
+    encounter_id = await svc_create_encounter(req.patient_id, session_id, purpose)
     if encounter_id:
       SESSION_TO_ENCOUNTER[session_id] = encounter_id
     SESSION_TO_PATIENT[session_id] = req.patient_id
@@ -291,157 +206,8 @@ async def bootstrap(req: BootstrapRequest):
   except Exception as e:
     logger.warning("BOOTSTRAP_ENCOUNTER_FAIL: %s", e)
 
-  nombre = (patient_res or {}).get("nombre") if isinstance(patient_res, dict) else None
-  motivos = (motivos_res or {}).get("motivos") if isinstance(motivos_res, dict) else None
-  motivos_msg = (motivos_res or {}).get("mensaje") if isinstance(motivos_res, dict) else None
-  areas = (areas_res or {}).get("areas") if isinstance(areas_res, dict) else None
-  imc_val = None
-  imc_score = None
-  if isinstance(score_res, dict):
-    imc = score_res.get("imc") or {}
-    imc_val = imc.get("valor")
-    imc_score = imc.get("score")
-  edad_val = None
-  edad_score = None
-  if isinstance(score_res, dict):
-    ed = score_res.get("edad") or {}
-    edad_val = ed.get("valor")
-    edad_score = ed.get("score")
-  cintura_val = None
-  cintura_score = None
-  fumar_estado = None
-  fumar_score = None
-  if isinstance(score_res, dict):
-    cin = score_res.get("cintura_cm") or {}
-    cintura_val = cin.get("valor")
-    cintura_score = cin.get("score")
-    f = score_res.get("fumar") or {}
-    fumar_estado = f.get("estado")
-    fumar_score = f.get("score")
-  sexo_genero = None
-  sexo_score = None
-  if isinstance(score_res, dict):
-    sx = score_res.get("sexo") or {}
-    sexo_genero = sx.get("genero")
-    sexo_score = sx.get("score")
-  analytes_score = None
-  fpg_val = None
-  fpg_cat = None
-  a1c_val = None
-  a1c_cat = None
-  if isinstance(score_res, dict):
-    an = score_res.get("analitos") or {}
-    analytes_score = an.get("score")
-    fpg = an.get("fpg") or {}
-    a1c = an.get("hba1c") or {}
-    fpg_val = fpg.get("valor")
-    fpg_cat = fpg.get("categoria")
-    a1c_val = a1c.get("valor")
-    a1c_cat = a1c.get("categoria")
-  trig_val = None
-  trig_score = None
-  if isinstance(score_res, dict):
-    tr = score_res.get("trigliceridos") or {}
-    trig_val = tr.get("valor")
-    trig_score = tr.get("score")
-  hdl_val = None
-  hdl_score = None
-  if isinstance(score_res, dict):
-    hdl = score_res.get("hdl") or {}
-    hdl_val = hdl.get("valor")
-    hdl_score = hdl.get("score")
-  riesgo_cat = None
-  riesgo_pct = None
-  riesgo_pts_obt = None
-  riesgo_pts_max = None
-  if isinstance(score_res, dict):
-    rg = score_res.get("riesgo_global") or {}
-    riesgo_cat = rg.get("categoria")
-    pts = rg.get("puntos") or {}
-    riesgo_pct = pts.get("porcentaje")
-    riesgo_pts_obt = pts.get("obtenidos")
-    riesgo_pts_max = pts.get("maximos")
-
-  # Crear RiskAssessment únicamente en el flujo de riesgo
-  risk_assessment_id = None
-  if agent_kind == "risk":
-    try:
-      outcome_map = {"bajo": "low", "medio": "medium", "alto": "high"}
-      outcome_code = outcome_map.get(str(riesgo_cat).lower(), "low")
-      # Componer rationale sencillo en prosa con variables disponibles
-      rationale_parts = []
-      if imc_val is not None: rationale_parts.append(f"IMC {imc_val} (score {imc_score if imc_score is not None else 'NA'})")
-      if cintura_val is not None: rationale_parts.append(f"cintura {cintura_val} cm (score {cintura_score if cintura_score is not None else 'NA'})")
-      if fumar_estado is not None: rationale_parts.append(f"tabaquismo: {fumar_estado} (score {fumar_score if fumar_score is not None else 'NA'})")
-      if fpg_val is not None and fpg_cat: rationale_parts.append(f"glucosa {fpg_val} mg/dL ({fpg_cat})")
-      if a1c_val is not None and a1c_cat: rationale_parts.append(f"HbA1c {a1c_val}% ({a1c_cat})")
-      if trig_val is not None: rationale_parts.append(f"triglicéridos {trig_val} mg/dL (score {trig_score if trig_score is not None else 'NA'})")
-      if hdl_val is not None: rationale_parts.append(f"HDL {hdl_val} mg/dL (score {hdl_score if hdl_score is not None else 'NA'})")
-      fam_score_local = None
-      try:
-        if isinstance(score_res, dict):
-          fam = score_res.get("antecedentes_familiares") or {}
-          fam_score_local = fam.get("primer_grado_riesgo")
-      except Exception:
-        fam_score_local = None
-      if fam_score_local is not None: rationale_parts.append(f"antecedentes familiares (score {fam_score_local})")
-      rationale_text = (
-        f"Resultado de riesgo {outcome_code} basado en: " + ", ".join(rationale_parts) if rationale_parts else f"Resultado de riesgo {outcome_code}."
-      )
-      from fhir_clini_assistant.fhir_tools import CreateRiskAssessmentTool
-      ra_tool = CreateRiskAssessmentTool()
-      ra_args = {
-        "patient_id": req.patient_id,
-        "session_id": session_id,
-        "encounter_id": encounter_id,
-        "outcome": outcome_code,
-        "rationale": rationale_text,
-        "occurrence_datetime": datetime.now(timezone.utc).isoformat(),
-        "evidence": (score_res or {}).get("evidence") if isinstance(score_res, dict) else None,
-      }
-      ra_res = await ra_tool.run_async(args=ra_args, tool_context=None)
-      risk_assessment_id = (ra_res or {}).get("risk_assessment_id")
-      logger.info("BOOTSTRAP_RISK_ASSESSMENT_CREATED id=%s outcome=%s", risk_assessment_id, outcome_code)
-    except Exception as e:
-      logger.warning("BOOTSTRAP_RISK_ASSESSMENT_FAIL: %s", e)
-
-  fam_score = None
-  fam_matches = []
-  if isinstance(score_res, dict):
-    fam = score_res.get("antecedentes_familiares") or {}
-    fam_score = fam.get("primer_grado_riesgo")
-    fam_matches = fam.get("coincidencias") or []
-
-  context_lines = []
-  if nombre: context_lines.append(f"Paciente: {nombre}")
-  if motivos:
-    context_lines.append("Motivos: " + ", ".join(motivos))
-  elif motivos_msg:
-    context_lines.append("[hint] No hay motivos de consulta registrados en el triage; pide el motivo principal al paciente.")
-  if areas: context_lines.append("Áreas afectadas: " + ", ".join(areas))
-  if imc_val is not None:
-    context_lines.append(f"IMC: {imc_val} (score {imc_score if imc_score is not None else 'NA'})")
-  if edad_val is not None:
-    context_lines.append(f"Edad: {edad_val} (score {edad_score if edad_score is not None else 'NA'})")
-  if cintura_val is not None:
-    context_lines.append(f"Cintura: {cintura_val} cm (score {cintura_score if cintura_score is not None else 'NA'})")
-  if fumar_estado is not None:
-    context_lines.append(f"Fumar: {fumar_estado} (score {fumar_score if fumar_score is not None else 'NA'})")
-  if sexo_genero is not None:
-    context_lines.append(f"Sexo: {sexo_genero} (score {sexo_score if sexo_score is not None else 'NA'})")
-  if analytes_score is not None:
-    context_lines.append(f"Analitos (score global): {analytes_score}")
-  if fpg_val is not None and fpg_cat is not None:
-    context_lines.append(f"Glucosa: {fpg_val} mg/dL ({fpg_cat})")
-  if a1c_val is not None and a1c_cat is not None:
-    context_lines.append(f"HbA1c: {a1c_val}% ({a1c_cat})")
-  if trig_val is not None:
-    context_lines.append(f"Triglicéridos: {trig_val} (score {trig_score if trig_score is not None else 'NA'})")
-  if hdl_val is not None:
-    context_lines.append(f"HDL: {hdl_val} (score {hdl_score if hdl_score is not None else 'NA'})")
-  if fam_score is not None:
-    context_lines.append(f"Antecedentes familiares (score): {fam_score} – {', '.join(fam_matches) if fam_matches else 'sin coincidencias destacadas'}")
-
+  # Build kickoff context
+  context_lines = svc_build_ctx(patient_res, motivos_res, areas_res, score_res)
   kickoff = "\n".join(context_lines) if context_lines else None
 
   # First agent message
@@ -468,91 +234,12 @@ async def bootstrap(req: BootstrapRequest):
 
   return {"session_id": session_id, "reply": first_reply, "prefetch": {
     "patient": patient_res, "motivos": motivos_res, "areas": areas_res, "score": score_res,
-  }, "encounter_id": encounter_id, "risk_assessment_id": risk_assessment_id}
+  }, "encounter_id": encounter_id, "risk_assessment_id": None}
 
 async def _llm_extract_criterios(session_id: str, user_text: str):
+  # Delegate to service implementation for consistency
   try:
-    from fhir_clini_assistant.fhir_tools import get_checklist_snapshot, UpdateCriterioEstadoTool
-  except Exception as e:
-    logger.debug("CHECKLIST_EXTRACT_IMPORT_FAIL: %s", e)
-    return
-  snap = get_checklist_snapshot(session_id)
-  if not (snap and snap.get("exists")):
-    return
-  items = snap.get("pending_items") or []
-  if not items:
-    return
-  area = snap.get("area") or ""
-  try:
-    client = genai.Client()
-    model_id = os.getenv("ANAMNESIS_EXTRACTOR_MODEL", os.getenv("ANAMNESIS_AGENT_MODEL", "gemini-2.5-flash"))
-    system = (
-      "Eres un asistente clínico que extrae datos estructurados. "
-      "Recibirás un área clínica activa y una lista de criterios (checklist). "
-      "A partir del texto del paciente, indica qué criterios quedan satisfechos, su valor y una confianza 0..1. "
-      "Responde SOLO en JSON. Formatos válidos: {\"items\":[{\"criterio\":...,\"value\":...,\"confidence\":0.0-1.0}]} o bien una lista simple de esos objetos. "
-      "Usa exactamente los nombres de criterio provistos (case-insensitive). No inventes valores."
-    )
-    prompt = {
-      "area": area,
-      "criterios_pendientes": items,
-      "texto_paciente": user_text,
-      "output": {"items": [{"criterio": "<nombre exacto>", "value": "<resumen breve>", "confidence": 0.0}]}
-    }
-    logger.info("CHECKLIST_EXTRACT_REQ session_id=%s area=%s pending=%s text=%.120s", session_id, area, len(items), (user_text or "")[:120])
-    msg = genai_types.Content(role="user", parts=[genai_types.Part(text=system + "\n" + json.dumps(prompt, ensure_ascii=False))])
-    resp = await client.aio.models.generate_content(model=model_id, contents=[msg])
-    logger.info("CHECKLIST_EXTRACT_MODEL=%s", model_id)
-    text = ""
-    try:
-      if resp and resp.candidates and resp.candidates[0].content and resp.candidates[0].content.parts:
-        text = "".join([p.text or "" for p in resp.candidates[0].content.parts if getattr(p, "text", None)])
-    except Exception:
-      text = ""
-    logger.info("CHECKLIST_EXTRACT_RAW session_id=%s len=%d text=%.200s", session_id, len(text or ""), (text or "")[:200])
-    if not text:
-      return
-    # Parse JSON (tolerant)
-    data = None
-    try:
-      data = json.loads(text)
-    except Exception:
-      try:
-        start = text.find("[")
-        end = text.rfind("]")
-        if start >= 0 and end > start:
-          data = json.loads(text[start:end+1])
-      except Exception:
-        data = None
-    if data is None:
-      logger.info("CHECKLIST_EXTRACT_PARSE_FAIL session_id=%s", session_id)
-      return
-    # Normalize to list under key "items"
-    if isinstance(data, dict) and isinstance(data.get("items"), list):
-      items_out = data.get("items")
-    elif isinstance(data, list):
-      items_out = data
-    else:
-      logger.info("CHECKLIST_EXTRACT_PARSE_EMPTY session_id=%s", session_id)
-      return
-    tool = UpdateCriterioEstadoTool()
-    applied = 0
-    for obj in items_out:
-      try:
-        crit = (obj or {}).get("criterio")
-        val = (obj or {}).get("value")
-        conf = (obj or {}).get("confidence")
-        if conf is not None:
-          try:
-            conf = float(conf)
-          except Exception:
-            conf = None
-        if crit and val and (conf is None or conf >= float(os.getenv("ANAMNESIS_EXTRACT_CONF_THRESH", "0.6"))):
-          await tool.run_async(args={"session_id": session_id, "criterio": str(crit), "status": "answered", "value": str(val)}, tool_context=None)
-          applied += 1
-      except Exception as e:
-        logger.debug("CHECKLIST_EXTRACT_APPLY_FAIL criterio=%s err=%s", (obj or {}).get("criterio"), e)
-    logger.info("CHECKLIST_EXTRACT_APPLIED session_id=%s area=%s matched=%d", session_id, area, applied)
+    await svc_llm_extract_criterios(session_id, user_text)
   except Exception as e:
     logger.debug("CHECKLIST_EXTRACT_FAIL: %s", e)
 
@@ -566,19 +253,425 @@ def _extract_summary_from_text(text: str) -> Optional[str]:
     return text[m.start():].strip()[:4000]
   return None
 
+# Deterministic closing blocks parsing and validation (added)
+def _parse_closing_blocks(text: str) -> tuple[Optional[str], Optional[dict]]:
+  return svc_parse_closing_blocks(text)
+
+# Sanitize visible markdown from any accidental code/tool noise (added)
+def _sanitize_visible_markdown(md: str) -> str:
+  return svc_sanitize_visible(md)
+
+# Minimal validation of CI payload (added)
+def _validate_ci_payload(d: dict) -> tuple[bool, str]:
+  try:
+    ci = d.get("clinical_impression")
+    if not isinstance(ci, dict):
+      return False, "missing clinical_impression object"
+    req = ("status", "subject_ref", "encounter_ref", "summary", "protocols")
+    for k in req:
+      if k not in ci:
+        return False, f"missing {k}"
+    if not isinstance(ci["status"], str): return False, "status must be str"
+    if not (isinstance(ci["subject_ref"], str) and ci["subject_ref"].startswith("Patient/")):
+      return False, "subject_ref must be 'Patient/<id>'"
+    if not (isinstance(ci["encounter_ref"], str) and ci["encounter_ref"].startswith("Encounter/")):
+      return False, "encounter_ref must be 'Encounter/<id>'"
+    if not isinstance(ci["summary"], str): return False, "summary must be str"
+    if not isinstance(ci["protocols"], list): return False, "protocols must be list"
+    return True, "ok"
+  except Exception as e:
+    return False, f"exception {e}"
+
+# Execute CI creation and encounter completion with idempotency and retries (added)
+async def _deterministic_close(session_id: str, user_id: str, visible_md: str, payload: dict) -> tuple[bool, str]:
+  ok, reason = _validate_ci_payload(payload)
+  if not ok:
+    logger.warning("CLOSE_VALIDATION_FAIL session_id=%s msg=%s", session_id, reason)
+    return False, "validation_fail"
+  ci = payload["clinical_impression"]
+  subject_ref = ci.get("subject_ref")
+  encounter_ref = ci.get("encounter_ref")
+  # Prefer patient_id from server mapping; fallback to subject_ref if valid
+  mapped_pid = SESSION_TO_PATIENT.get(session_id)
+  patient_id = mapped_pid if mapped_pid else (subject_ref.split("/", 1)[1] if isinstance(subject_ref, str) and subject_ref.lower().startswith("patient/") else "")
+  # Prefer encounter from session mapping; fallback to payload if looks valid
+  encounter_id = SESSION_TO_ENCOUNTER.get(session_id)
+  if not encounter_id and isinstance(encounter_ref, str) and encounter_ref.lower().startswith("encounter/"):
+    eid = encounter_ref.split("/", 1)[1].strip()
+    if eid and "<" not in eid and ">" not in eid:
+      encounter_id = eid
+  summary = ci.get("summary") or ""
+
+  # Idempotency by hash of CI object
+  try:
+    canon = json.dumps(ci, sort_keys=True, ensure_ascii=False)
+  except Exception:
+    canon = str(ci)
+  plan_hash = hashlib.sha256(canon.encode("utf-8")).hexdigest()
+  seen = ENCOUNTER_PLAN_HASHES.setdefault(encounter_id or session_id, set())
+  if plan_hash in seen:
+    logger.info("CLOSE_IDEMPOTENT_SKIP encounter=%s hash=%s", (encounter_id or session_id), plan_hash[:12])
+    # Ensure encounter finished
+    try:
+      from fhir_clini_assistant.fhir_tools import UpdateEncounterStatusTool
+      args_up = {"status": CLOSE_STATUS}
+      if encounter_id:
+        args_up["encounter_id"] = encounter_id
+      else:
+        args_up["session_id"] = session_id
+      await UpdateEncounterStatusTool().run_async(args=args_up, tool_context=None)
+      logger.info("CLOSE_ENCOUNTER_OK encounter=%s (idempotent)", (encounter_id or session_id))
+    except Exception as e:
+      logger.warning("CLOSE_ENCOUNTER_FAIL encounter=%s err=%s (idempotent)", (encounter_id or session_id), e)
+      if USE_FHIR_FALLBACK:
+        try:
+          await _complete_encounter_fallback(encounter_id=encounter_id, session_id=session_id)
+          logger.info("CLOSE_ENCOUNTER_OK_FALLBACK encounter=%s (idempotent)", (encounter_id or session_id))
+        except Exception as e2:
+          logger.warning("CLOSE_ENCOUNTER_FAIL_FALLBACK encounter=%s err=%s (idempotent)", (encounter_id or session_id), e2)
+    return True, plan_hash
+
+  # Create CI with retries, then finish encounter
+  # Use service wrappers for FHIR operations
+  args_ci = {"patient_id": patient_id, "summary": summary}
+  if encounter_id:
+    args_ci["encounter_id"] = encounter_id
+  else:
+    args_ci["session_id"] = session_id
+  attempts = 0
+  last_err = None
+  while attempts < 3:
+    attempts += 1
+    try:
+      res = await fhir_create_ci(args_ci)
+      ci_id = (res or {}).get("clinical_impression_id")
+      logger.info("CLOSE_CI_OK encounter=%s patient=%s hash=%s ci_id=%s", (encounter_id or session_id), patient_id, plan_hash[:12], ci_id)
+      seen.add(plan_hash)
+      try:
+        up_args = {"status": CLOSE_STATUS}
+        if encounter_id:
+          up_args["encounter_id"] = encounter_id
+        else:
+          up_args["session_id"] = session_id
+        await fhir_update_enc_status(up_args)
+        logger.info("CLOSE_ENCOUNTER_OK encounter=%s", (encounter_id or session_id))
+      except Exception as e:
+        logger.warning("CLOSE_ENCOUNTER_FAIL encounter=%s err=%s", (encounter_id or session_id), e)
+        if USE_FHIR_FALLBACK:
+          try:
+            # REST fallback
+            fhir_rest_finish(encounter_id=encounter_id, session_id=session_id, status=CLOSE_STATUS)
+            logger.info("CLOSE_ENCOUNTER_OK_FALLBACK encounter=%s", (encounter_id or session_id))
+          except Exception as e2:
+            logger.warning("CLOSE_ENCOUNTER_FAIL_FALLBACK encounter=%s err=%s", (encounter_id or session_id), e2)
+      return True, plan_hash
+    except Exception as e:
+      last_err = e
+      time.sleep(0.5 * attempts)
+  logger.warning("CLOSE_CI_FAIL encounter=%s patient=%s err=%s", (encounter_id or session_id), patient_id, last_err)
+  return False, "create_ci_failed"
+
+# Direct REST fallback to set Encounter.status (configurable)
+async def _complete_encounter_fallback(encounter_id: Optional[str], session_id: str) -> None:
+  # Delegate to service REST helper
+  fhir_rest_finish(encounter_id=encounter_id, session_id=session_id, status=CLOSE_STATUS)
+
 def _strip_tool_calls(text: str) -> str:
   if not text:
     return text
-  # Remove any lines that contain create_clinical_impression(...) or update_encounter_status(...)
-  lines = (text or "").splitlines()
-  cleaned = []
-  for ln in lines:
-    if re.search(r"\b(create_clinical_impression|update_encounter_status)\s*\(", ln):
+  removed_xml = 0
+  removed_func = 0
+  removed_yaml = 0
+  removed_json = 0
+  t = text
+  # Remove execute_tool_code blocks
+  t, n = re.subn(r"<\s*execute_tool_code\s*>[\s\S]*?<\s*/\s*execute_tool_code\s*>", "", t, flags=re.IGNORECASE)
+  removed_xml += n
+  # Remove XML-like tool tags with closing tag
+  t, n = re.subn(r"<\s*(?:tools\.)?(create_clinical_impression|update_encounter_status)\b[^>]*>[\s\S]*?<\s*/\s*\1\s*>", "", t, flags=re.IGNORECASE)
+  removed_xml += n
+  # Remove self-closing XML-like tags
+  t, n = re.subn(r"<\s*(?:tools\.)?(create_clinical_impression|update_encounter_status)\b[^>]*/\s*>", "", t, flags=re.IGNORECASE)
+  removed_xml += n
+  # Remove YAML-like blocks: tool_name: (newline) indented key: value lines
+  lines = t.splitlines()
+  out_lines = []
+  i = 0
+  while i < len(lines):
+    ln = lines[i]
+    m = re.match(r"\s*(?:tools\.)?(create_clinical_impression|update_encounter_status)\s*:\s*$", ln, flags=re.IGNORECASE)
+    if m:
+      removed_yaml += 1
+      i += 1
+      # Skip indented block
+      while i < len(lines):
+        if lines[i].strip() == "":
+          i += 1
+          continue
+        if re.match(r"\s+\S", lines[i]):
+          i += 1
+          continue
+        break
       continue
-    # remove inline code fences around those calls
-    ln2 = re.sub(r"`\s*(create_clinical_impression|update_encounter_status)\s*\([^`]*\)`", "", ln)
-    cleaned.append(ln2)
-  return "\n".join(cleaned).strip()
+    out_lines.append(ln)
+    i += 1
+  t = "\n".join(out_lines)
+  # Remove JSON tool blocks (simple heuristic: single-object blocks containing tool_code with our tool names)
+  t, n = re.subn(r"\{[\s\S]*?\btool_code\b\s*:\s*\"(create_clinical_impression|update_encounter_status)\"[\s\S]*?\}", "", t, flags=re.IGNORECASE)
+  removed_json += n
+  # Remove function-call forms anywhere (with optional tools. prefix)
+  t, n = re.subn(r"(?:tools\.)?(create_clinical_impression|update_encounter_status)\s*\([^\)]*\)", "", t, flags=re.IGNORECASE)
+  removed_func += n
+  # Remove inline code-fenced function calls and empty fences
+  t = re.sub(r"`\s*(?:tools\.)?(create_clinical_impression|update_encounter_status)\s*\([^`]*\)`", "", t, flags=re.IGNORECASE)
+  t = re.sub(r"(^|\n)>?\s*``\s*(\n|$)", "\n", t)  # strip lonely ``` remnants
+  # Collapse excessive blank lines
+  t = re.sub(r"\n{3,}", "\n\n", t)
+  if removed_xml or removed_func or removed_yaml or removed_json:
+    try:
+      logger.info("STRIP_TOOL_CALLS removed xml=%d yaml=%d json=%d func=%d", removed_xml, removed_yaml, removed_json, removed_func)
+    except Exception:
+      pass
+  return t.strip()
+
+async def _execute_xml_tool_tags(session_id: str, text: str) -> bool:
+  if not text:
+    return False
+  ran_any = False
+  try:
+    ft = importlib.import_module('fhir_clini_assistant.fhir_tools')
+    CreateClinicalImpressionTool = getattr(ft, 'CreateClinicalImpressionTool', None)
+    UpdateEncounterStatusTool = getattr(ft, 'UpdateEncounterStatusTool', None)
+
+    def _parse_attrs(attrs_str: str) -> dict:
+      out = {}
+      # Support attr="..." or attr='...'
+      for m in re.finditer(r"(\w+)\s*=\s*\"([^\"]*)\"", attrs_str):
+        out[m.group(1)] = m.group(2)
+      for m in re.finditer(r"(\w+)\s*=\s*'([^']*)'", attrs_str):
+        out[m.group(1)] = m.group(2)
+      return out
+
+    # Closing-tag form
+    pattern_close = re.compile(r"<\s*(?:tools\.)?(create_clinical_impression|update_encounter_status)\b([^>]*)>([\s\S]*?)<\s*/\s*\1\s*>", re.IGNORECASE)
+    # Self-closing form
+    pattern_self = re.compile(r"<\s*(?:tools\.)?(create_clinical_impression|update_encounter_status)\b([^>]*)/\s*>", re.IGNORECASE)
+
+    matches = list(pattern_close.finditer(text)) + list(pattern_self.finditer(text))
+    if matches:
+      logger.info("EXEC_XML_TOOL found=%d", len(matches))
+    for m in matches:
+      fname = m.group(1).lower()
+      attrs = _parse_attrs(m.group(2) or "")
+      inner = m.group(3) if m.lastindex and m.lastindex >= 3 else None
+      kwargs = dict(attrs)
+      # Normalize keys
+      if fname == 'create_clinical_impression':
+        if 'summary' not in kwargs:
+          if 'clinical_impression' in kwargs:
+            kwargs['summary'] = kwargs.pop('clinical_impression')
+          elif 'impression' in kwargs:
+            kwargs['summary'] = kwargs.pop('impression')
+          elif inner and inner.strip():
+            kwargs['summary'] = inner.strip()
+        if CreateClinicalImpressionTool:
+          ci_tool = CreateClinicalImpressionTool()
+          res = await ci_tool.run_async(args=kwargs, tool_context=None)
+          logger.info("CI_CREATE_OK_XML session_id=%s res=%s", session_id, (res or {}))
+          # Auto-close after CI
+          try:
+            enc_id = SESSION_TO_ENCOUNTER.get(session_id)
+            up_tool = UpdateEncounterStatusTool()
+            if enc_id:
+              await up_tool.run_async(args={"encounter_id": enc_id, "status": "completed"}, tool_context=None)
+            else:
+              await up_tool.run_async(args={"session_id": session_id, "status": "completed"}, tool_context=None)
+            logger.info("ENCOUNTER_AUTOCLOSE_OK_XML session_id=%s", session_id)
+          except Exception as e:
+            logger.warning("ENCOUNTER_AUTOCLOSE_FAIL_XML session_id=%s err=%s", session_id, e)
+          ran_any = True
+      elif fname == 'update_encounter_status':
+        if 'encounter_id' not in kwargs and 'session_id' not in kwargs:
+          enc_id = SESSION_TO_ENCOUNTER.get(session_id)
+          if enc_id:
+            kwargs['encounter_id'] = enc_id
+          else:
+            kwargs['session_id'] = session_id
+        if UpdateEncounterStatusTool:
+          up_tool = UpdateEncounterStatusTool()
+          res = await up_tool.run_async(args=kwargs, tool_context=None)
+          logger.info("ENCOUNTER_UPDATE_OK_XML session_id=%s res=%s", session_id, (res or {}))
+          ran_any = True
+  except Exception as e:
+    logger.warning("EXEC_XML_TOOL_FAIL session_id=%s err=%s", session_id, e)
+  return ran_any
+
+async def _execute_yaml_tool_plans(session_id: str, text: str) -> bool:
+  if not text:
+    return False
+  ran_any = False
+  try:
+    ft = importlib.import_module('fhir_clini_assistant.fhir_tools')
+    CreateClinicalImpressionTool = getattr(ft, 'CreateClinicalImpressionTool', None)
+    UpdateEncounterStatusTool = getattr(ft, 'UpdateEncounterStatusTool', None)
+    lines = (text or "").splitlines()
+    i = 0
+    found = 0
+    while i < len(lines):
+      ln = lines[i]
+      m = re.match(r"\s*(?:tools\.)?(create_clinical_impression|update_encounter_status)\s*:\s*$", ln, flags=re.IGNORECASE)
+      if not m:
+        i += 1
+        continue
+      tool_name = m.group(1).lower()
+      i += 1
+      block = []
+      while i < len(lines):
+        cur = lines[i]
+        if cur.strip() == "":
+          block.append(cur)
+          i += 1
+          continue
+        if re.match(r"\s+\S", cur):
+          block.append(cur)
+          i += 1
+          continue
+        break
+      # Parse key: value pairs
+      kwargs = {}
+      for b in block:
+        mm = re.match(r"\s*([A-Za-z_][\w\-]*)\s*:\s*(.*)$", b)
+        if not mm:
+          continue
+        k = mm.group(1)
+        v = mm.group(2).strip()
+        if v.startswith('"') and v.endswith('"') and len(v) >= 2:
+          v = v[1:-1]
+        elif v.startswith("'") and v.endswith("'") and len(v) >= 2:
+          v = v[1:-1]
+        elif v.lower() in ("null", "none"):
+          v = None
+        else:
+          # Try numeric
+          try:
+            if "." in v:
+              v = float(v)
+            else:
+              v = int(v)
+          except Exception:
+            pass
+        kwargs[k] = v
+      # Normalize keys
+      if tool_name == 'create_clinical_impression' and CreateClinicalImpressionTool:
+        if 'summary' not in kwargs:
+          for alt in ('clinical_impression', 'impression', 'impression_text'):
+            if alt in kwargs:
+              kwargs['summary'] = kwargs.pop(alt)
+              break
+        ci = CreateClinicalImpressionTool()
+        res = await ci.run_async(args=kwargs, tool_context=None)
+        logger.info("CI_CREATE_OK_YAML session_id=%s res=%s", session_id, (res or {}))
+        # Auto-close after CI
+        try:
+          enc_id = SESSION_TO_ENCOUNTER.get(session_id)
+          up = UpdateEncounterStatusTool()
+          if enc_id:
+            await up.run_async(args={"encounter_id": enc_id, "status": "completed"}, tool_context=None)
+          else:
+            await up.run_async(args={"session_id": session_id, "status": "completed"}, tool_context=None)
+          logger.info("ENCOUNTER_AUTOCLOSE_OK_YAML session_id=%s", session_id)
+        except Exception as e:
+          logger.warning("ENCOUNTER_AUTOCLOSE_FAIL_YAML session_id=%s err=%s", session_id, e)
+        ran_any = True
+        found += 1
+      elif tool_name == 'update_encounter_status' and UpdateEncounterStatusTool:
+        if 'encounter_id' not in kwargs and 'session_id' not in kwargs:
+          enc_id = SESSION_TO_ENCOUNTER.get(session_id)
+          if enc_id:
+            kwargs['encounter_id'] = enc_id
+          else:
+            kwargs['session_id'] = session_id
+        up = UpdateEncounterStatusTool()
+        res = await up.run_async(args=kwargs, tool_context=None)
+        logger.info("ENCOUNTER_UPDATE_OK_YAML session_id=%s res=%s", session_id, (res or {}))
+        ran_any = True
+        found += 1
+    if found:
+      logger.info("EXEC_YAML_TOOL found=%d", found)
+  except Exception as e:
+    logger.warning("EXEC_YAML_TOOL_FAIL session_id=%s err=%s", session_id, e)
+  return ran_any
+
+async def _execute_json_tool_blocks(session_id: str, text: str) -> bool:
+  if not text:
+    return False
+  ran_any = False
+  try:
+    ft = importlib.import_module('fhir_clini_assistant.fhir_tools')
+    CreateClinicalImpressionTool = getattr(ft, 'CreateClinicalImpressionTool', None)
+    UpdateEncounterStatusTool = getattr(ft, 'UpdateEncounterStatusTool', None)
+    # Find all JSON objects in text that contain tool_code
+    objs = []
+    for m in re.finditer(r"\{[\s\S]*?\}", text):
+      chunk = m.group(0)
+      if 'tool_code' not in chunk:
+        continue
+      try:
+        data = json.loads(chunk)
+        if isinstance(data, dict) and str(data.get('tool_code', '')).lower() in ('create_clinical_impression','update_encounter_status'):
+          objs.append(data)
+      except Exception:
+        # Try to replace single quotes with double quotes as a fallback
+        try:
+          data = json.loads(chunk.replace("'", '"'))
+          if isinstance(data, dict) and str(data.get('tool_code', '')).lower() in ('create_clinical_impression','update_encounter_status'):
+            objs.append(data)
+        except Exception:
+          continue
+    if objs:
+      logger.info("EXEC_JSON_TOOL found=%d", len(objs))
+    for data in objs:
+      name = str(data.get('tool_code', '')).lower()
+      if name == 'create_clinical_impression' and CreateClinicalImpressionTool:
+        kwargs = dict(data)
+        # Normalize keys
+        kwargs.pop('tool_code', None)
+        if 'summary' not in kwargs:
+          for alt in ('clinical_impression','impression','impression_text','text'):
+            if alt in kwargs and kwargs.get(alt):
+              kwargs['summary'] = kwargs.pop(alt)
+              break
+        ci_tool = CreateClinicalImpressionTool()
+        res = await ci_tool.run_async(args=kwargs, tool_context=None)
+        logger.info("CI_CREATE_OK_JSON session_id=%s res=%s", session_id, (res or {}))
+        # Auto-close
+        try:
+          up = UpdateEncounterStatusTool()
+          enc_id = SESSION_TO_ENCOUNTER.get(session_id)
+          if enc_id:
+            await up.run_async(args={"encounter_id": enc_id, "status": "completed"}, tool_context=None)
+          else:
+            await up.run_async(args={"session_id": session_id, "status": "completed"}, tool_context=None)
+          logger.info("ENCOUNTER_AUTOCLOSE_OK_JSON session_id=%s", session_id)
+        except Exception as e:
+          logger.warning("ENCOUNTER_AUTOCLOSE_FAIL_JSON session_id=%s err=%s", session_id, e)
+        ran_any = True
+      elif name == 'update_encounter_status' and UpdateEncounterStatusTool:
+        kwargs = dict(data)
+        kwargs.pop('tool_code', None)
+        # Prefer mapping if encounter_id missing or looks like session
+        if 'encounter_id' not in kwargs and 'session_id' not in kwargs:
+          enc_id = SESSION_TO_ENCOUNTER.get(session_id)
+          if enc_id:
+            kwargs['encounter_id'] = enc_id
+          else:
+            kwargs['session_id'] = session_id
+        res = await UpdateEncounterStatusTool().run_async(args=kwargs, tool_context=None)
+        logger.info("ENCOUNTER_UPDATE_OK_JSON session_id=%s res=%s", session_id, (res or {}))
+        ran_any = True
+  except Exception as e:
+    logger.warning("EXEC_JSON_TOOL_FAIL session_id=%s err=%s", session_id, e)
+  return ran_any
 
 async def _execute_tool_code(session_id: str, text: str) -> bool:
   if not text:
@@ -588,11 +681,21 @@ async def _execute_tool_code(session_id: str, text: str) -> bool:
   code = block.group(1) if block else text
   ran_any = False
   try:
-    # Find all function calls with optional 'tools.' prefix
+    logger.info("EXEC_TOOL_SCAN session_id=%s len=%d", session_id, len(text or ""))
+    # First, execute any XML-like tags
+    xml_any = await _execute_xml_tool_tags(session_id, text)
+    ran_any = ran_any or xml_any
+    # Then, execute YAML-like tool plans
+    yaml_any = await _execute_yaml_tool_plans(session_id, text)
+    ran_any = ran_any or yaml_any
+    # Then, execute JSON-like tool blocks
+    json_any = await _execute_json_tool_blocks(session_id, text)
+    ran_any = ran_any or json_any
+    # Then, find function calls with optional 'tools.' prefix
     pattern = re.compile(r"(?:tools\.)?(create_clinical_impression|update_encounter_status)\s*\((.*?)\)", re.DOTALL | re.IGNORECASE)
     matches = list(pattern.finditer(code))
     if not matches:
-      return False
+      return ran_any
     ft = importlib.import_module('fhir_clini_assistant.fhir_tools')
     CreateClinicalImpressionTool = getattr(ft, 'CreateClinicalImpressionTool', None)
     UpdateEncounterStatusTool = getattr(ft, 'UpdateEncounterStatusTool', None)
@@ -618,6 +721,17 @@ async def _execute_tool_code(session_id: str, text: str) -> bool:
           kwargs['summary'] = kwargs.pop('impression')
         res = await ci_tool.run_async(args=kwargs, tool_context=None)
         logger.info("CI_CREATE_OK session_id=%s res=%s", session_id, (res or {}))
+        # Auto-close after CI
+        try:
+          enc_id = SESSION_TO_ENCOUNTER.get(session_id)
+          up_tool = UpdateEncounterStatusTool()
+          if enc_id:
+            await up_tool.run_async(args={"encounter_id": enc_id, "status": "completed"}, tool_context=None)
+          else:
+            await up_tool.run_async(args={"session_id": session_id, "status": "completed"}, tool_context=None)
+          logger.info("ENCOUNTER_AUTOCLOSE_OK session_id=%s", session_id)
+        except Exception as e:
+          logger.warning("ENCOUNTER_AUTOCLOSE_FAIL session_id=%s err=%s", session_id, e)
         ran_any = True
       elif fname == 'update_encounter_status' and UpdateEncounterStatusTool:
         up_tool = UpdateEncounterStatusTool()
@@ -688,46 +802,14 @@ async def chat(req: ChatRequest):
   # Append user message to transcript
   SESSION_TO_TRANSCRIPT.setdefault(session_id, []).append(("user", req.message))
 
-  # Server-side structured extraction: update checklist from user text if checklist exists
-  try:
-    ft2 = importlib.import_module('fhir_clini_assistant.fhir_tools')
-    snap_fn2 = getattr(ft2, 'get_checklist_snapshot', None)
-    snap_exists = bool(snap_fn2 and snap_fn2(session_id).get("exists"))
-  except Exception:
-    snap_exists = False
-  if snap_exists:
-    try:
-      await _llm_extract_criterios(session_id, req.message or "")
-    except Exception as _:
-      pass
-
   # Compose content from user (+ optional hidden checklist anchor)
-  parts = [types.Part.from_text(text=req.message)]
-  try:
-    # Hidden session/patient info for tool calls
-    effective_pid = req.patient_id or SESSION_TO_PATIENT.get(session_id) or ""
-    parts.insert(0, types.Part.from_text(text=f"session_id={session_id}"))
-    if effective_pid:
-      parts.insert(1, types.Part.from_text(text=f"patient_id={effective_pid}"))
-    parts.insert(2, types.Part.from_text(text=f"agent_kind={agent_kind}"))
-    # Snapshot checklist for anchoring (not shown to user)
-    ft3 = importlib.import_module('fhir_clini_assistant.fhir_tools')
-    snap_fn3 = getattr(ft3, 'get_checklist_snapshot', None)
-    snap = snap_fn3(session_id) if callable(snap_fn3) else None
-    if snap and snap.get("exists"):
-      counts = snap.get("counts") or {}
-      area = snap.get("area") or ""
-      pending = ", ".join((snap.get("pending_items") or [])[:4])
-      anchor = f"[checklist_anchor] area={area} counts={counts} pending4=[{pending}]"
-      parts.insert(3, types.Part.from_text(text=anchor))
-  except Exception as _:
-    pass
-
-  content = types.Content(role="user", parts=parts)
+  effective_pid = req.patient_id or SESSION_TO_PATIENT.get(session_id) or ""
+  part_texts = svc_build_user_parts(session_id, agent_kind, req.message, effective_pid or None)
+  parts = [types.Part.from_text(text=t) for t in part_texts]
 
   last_text = ""
   try:
-    async for event in active_runner.run_async(user_id=req.user_id, session_id=session_id, new_message=content):
+    async for event in active_runner.run_async(user_id=req.user_id, session_id=session_id, new_message=types.Content(role="user", parts=parts)):
       text_candidate = None
       if hasattr(event, "data") and getattr(event.data, "text", None):
         text_candidate = event.data.text
@@ -741,16 +823,28 @@ async def chat(req: ChatRequest):
   except Exception as e:
     logger.warning("CHAT_AGENT_FAIL: %s", e)
 
-  # Append agent reply to transcript
-  SESSION_TO_TRANSCRIPT.setdefault(session_id, []).append(("agent", last_text))
-
-  # Execute any tool code emitted by agent
-  try:
-    executed = await _execute_tool_code(session_id, last_text or "")
-    if executed:
-      logger.info("EXEC_TOOL_CODE_DONE session_id=%s", session_id)
-  except Exception as _:
-    pass
+  # Deterministic closure pipeline: parse two-block response first
+  logger.info("CHAT_REPLY_LEN session_id=%s len=%d", session_id, len(last_text or ""))
+  visible_md, ci_payload = _parse_closing_blocks(last_text or "")
+  logger.info("CHAT_BLOCKS_DETECT session_id=%s has_visible=%s has_json=%s", session_id, bool(visible_md), bool(ci_payload))
+  if visible_md and ci_payload:
+    sanitized = _sanitize_visible_markdown(visible_md)
+    ok, _ = await _deterministic_close(session_id=session_id, user_id=req.user_id, visible_md=sanitized, payload=ci_payload)
+    SESSION_TO_TRANSCRIPT.setdefault(session_id, []).append(("agent", sanitized))
+    return {"reply": sanitized}
+  # Else legacy path: execute any tool code emitted by agent before storing reply
+  if USE_LEGACY_EXEC:
+    try:
+      executed = await _execute_tool_code(session_id, last_text or "")
+      if executed:
+        logger.info("EXEC_TOOL_CODE_DONE session_id=%s", session_id)
+    except Exception as _:
+      pass
+  else:
+    logger.info("LEGACY_EXEC_DISABLED session_id=%s", session_id)
+  # Store and return cleaned text (tool instructions stripped and sanitized)
+  cleaned_reply = _sanitize_visible_markdown(_strip_tool_calls(last_text or ""))
+  SESSION_TO_TRANSCRIPT.setdefault(session_id, []).append(("agent", cleaned_reply))
 
   # Emit DEBUG with current checklist snapshot after agent reply
   try:
@@ -765,12 +859,14 @@ async def chat(req: ChatRequest):
   # Server-side fallback: si el agente no cierra, intenta generar ClinicalImpression
   try:
     # Triggers: explicit close phrases, presence of summary, or user's confirmation
-    lower_last = (last_text or "").lower()
+    lower_last = (cleaned_reply or "").lower()
     # Strip tool call lines before extracting summary
-    stripped_text = _strip_tool_calls(last_text or "")
+    stripped_text = cleaned_reply
+    logger.info("CLOSE_STRIP_LEN raw=%d stripped=%d", len(last_text or ''), len(stripped_text or ''))
     summary_text = _extract_summary_from_text(stripped_text)
     user_confirm = any((msg or "").lower().strip() in ("es correcto", "correcto") for role, msg in (SESSION_TO_TRANSCRIPT.get(session_id) or [])[-3:] if role == "user")
     trigger_close = any(k in lower_last for k in ["cerramos", "terminamos", "fin de la consulta", "con esto cerramos", "consulta ha finalizado"]) or summary_text is not None or user_confirm
+    logger.info("CLOSE_CHECK session_id=%s has_summary=%s user_confirm=%s trigger=%s", session_id, bool(summary_text), user_confirm, trigger_close)
     if trigger_close:
       # Generar resumen: preferir el extraído del mensaje; si no, pedir al modelo con todo el transcript
       resumen = summary_text
@@ -814,6 +910,7 @@ async def chat(req: ChatRequest):
         try:
           # Strip lingering tool-calls from resumen
           resumen_clean = _strip_tool_calls(resumen)
+          logger.info("CI_SUMMARY_LEN cleaned=%d", len(resumen_clean or ''))
           args_ci = {"patient_id": pid, "summary": resumen_clean}
           if enc_id:
             args_ci["encounter_id"] = enc_id
@@ -821,490 +918,21 @@ async def chat(req: ChatRequest):
             args_ci["session_id"] = session_id
           ci_res = await ci_tool.run_async(args=args_ci, tool_context=None)
           logger.info("CI_CREATE_OK_FALLBACK session_id=%s res=%s", session_id, (ci_res or {}))
-          if enc_id:
-            await up_tool.run_async(args={"encounter_id": enc_id, "status": "completed"}, tool_context=None)
-          else:
-            await up_tool.run_async(args={"session_id": session_id, "status": "completed"}, tool_context=None)
+          # Auto-close after CI created via fallback
+          try:
+            if enc_id:
+              await up_tool.run_async(args={"encounter_id": enc_id, "status": "completed"}, tool_context=None)
+            else:
+              await up_tool.run_async(args={"session_id": session_id, "status": "completed"}, tool_context=None)
+            logger.info("ENCOUNTER_AUTOCLOSE_OK_FALLBACK session_id=%s", session_id)
+          except Exception as e:
+            logger.warning("ENCOUNTER_AUTOCLOSE_FAIL_FALLBACK session_id=%s err=%s", session_id, e)
         except Exception as e:
           logger.warning("CI_CREATE_FAIL_FALLBACK session_id=%s err=%s", session_id, e)
   except Exception as e:
     logger.warning("CHAT_FALLBACK_CLOSE_FAIL: %s", e)
 
-  return {"reply": last_text or ""}
-
-
-# ========== WebRTC (Vertex Live API) ==========
-def _build_live_webrtc_urls() -> list[str]:
-  project = os.getenv("GOOGLE_CLOUD_PROJECT") or os.getenv("PROJECT_ID")
-  location = os.getenv("GOOGLE_CLOUD_LOCATION") or os.getenv("GOOGLE_CLOUD_REGION") or "us-central1"
-  model = os.getenv("LIVE_MODEL", "gemini-live-2.5-flash-preview-native-audio")
-  # Endpoint override if provided
-  override = os.getenv("LIVE_WEBRTC_URL")
-  if override:
-    return [override]
-  # Correct Live API (native audio) endpoint shape candidates
-  return [
-    f"https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}:live:webrtc?model=publishers/google/models/{model}",
-    f"https://{location}-aiplatform.googleapis.com/v1beta1/projects/{project}/locations/{location}:live:webrtc?model=publishers/google/models/{model}",
-    f"https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/live:webrtc?model=publishers/google/models/{model}",
-    f"https://{location}-aiplatform.googleapis.com/v1beta1/projects/{project}/locations/{location}/live:webrtc?model=publishers/google/models/{model}",
-  ]
-
-@app.post("/live/webrtc/offer")
-async def webrtc_offer(payload: dict):
-  try:
-    offer_type = (payload or {}).get("type") or "offer"
-    offer_sdp = (payload or {}).get("sdp") or ""
-    if not offer_sdp:
-      return JSONResponse({"error": "missing sdp"}, status_code=400)
-    urls = _build_live_webrtc_urls()
-    creds, _ = google_auth_default()
-    sess = AuthorizedSession(creds)
-
-    # Try each URL: JSON first, then SDP fallback
-    for url in urls:
-      # JSON attempt
-      try:
-        body = {"type": offer_type, "sdp": offer_sdp}
-        headers = {"Content-Type": "application/json"}
-        logger.info("LIVE_WEBRTC_FORWARD_JSON url=%s len_sdp=%d", url, len(offer_sdp))
-        resp = sess.post(url, headers=headers, json=body)
-        if resp.status_code == 200 and (resp.json() or {}).get("sdp"):
-          ans = resp.json() or {}
-          return JSONResponse({"type": ans.get("type", "answer"), "sdp": ans.get("sdp", "")})
-        logger.warning("LIVE_WEBRTC_JSON_FAIL status=%s body_len=%d url=%s", resp.status_code, len(getattr(resp, 'text', '') or ''), url)
-      except Exception as e:
-        logger.warning("LIVE_WEBRTC_JSON_EXC url=%s err=%s", url, e)
-
-      # SDP attempt
-      sdp_url = url + ("&alt=sdp" if "?" in url else "?alt=sdp")
-      headers_sdp = {"Content-Type": "application/sdp", "Accept": "application/sdp"}
-      logger.info("LIVE_WEBRTC_FORWARD_SDP url=%s len_sdp=%d", sdp_url, len(offer_sdp))
-      resp2 = sess.post(sdp_url, headers=headers_sdp, data=offer_sdp)
-      if resp2.status_code == 200:
-        answer_sdp = resp2.text or ""
-        if not answer_sdp.strip():
-          logger.warning("LIVE_WEBRTC_SDP_EMPTY url=%s", sdp_url)
-        return JSONResponse({"type": "answer", "sdp": answer_sdp})
-      logger.warning("LIVE_WEBRTC_SDP_ERROR status=%s url=%s", resp2.status_code, sdp_url)
-
-    return JSONResponse({"error": "live_api_error", "status": 404, "body": "All endpoint variants returned non-200"}, status_code=502)
-  except Exception as e:
-    logger.exception("LIVE_WEBRTC_EXCEPTION: %s", e)
-    return JSONResponse({"error": str(e)}, status_code=500)
-
-
-# Live voice endpoints (use live_runner/agent)
-@app.post("/bootstrap_live")
-async def bootstrap_live(req: BootstrapRequest):
-  if not live_runner:
-    logger.error("BOOTSTRAP_LIVE_UNAVAILABLE agents_dir=%s live_name=%s", AGENTS_DIR, LIVE_AGENT_NAME)
-    return JSONResponse({"error": "Live agent not available", "agents_dir": AGENTS_DIR, "live_agent_name": LIVE_AGENT_NAME}, status_code=503)
-  logger.info("BOOTSTRAP_LIVE_REQ user_id=%s patient_id=%s", req.user_id, req.patient_id)
-  logger.info("BOOTSTRAP_LIVE_AGENT_MODEL %s", getattr(live_agent, "model", None))
-  session = await live_runner.session_service.create_session(app_name="clini_assistant_live_api", user_id=req.user_id)
-  session_id = session.id
-  SESSION_TO_TRANSCRIPT[session_id] = []
-  # Reuse same prefetch and encounter creation as text
-  from fhir_clini_assistant.fhir_tools import GetPatientByIdTool, GetMotivoConsultaTool, GetAreasAfectadasTool, ScoreRiesgoTool
-  async def _safe(coro):
-    try:
-      return await coro
-    except Exception as e:
-      logger.warning("BOOTSTRAP_LIVE_PREFETCH_FAIL: %s", e)
-      return None
-  patient_res = await _safe(GetPatientByIdTool().run_async(args={"patient_id": req.patient_id}, tool_context=None))
-  motivos_res = await _safe(GetMotivoConsultaTool().run_async(args={"patient": req.patient_id}, tool_context=None))
-  areas_res = await _safe(GetAreasAfectadasTool().run_async(args={"patient": req.patient_id}, tool_context=None))
-  score_res = await _safe(ScoreRiesgoTool().run_async(args={"patient": req.patient_id}, tool_context=None))
-  # Context extraction similar to text bootstrap
-  nombre = (patient_res or {}).get("nombre") if isinstance(patient_res, dict) else None
-  motivos = (motivos_res or {}).get("motivos") if isinstance(motivos_res, dict) else None
-  motivos_msg = (motivos_res or {}).get("mensaje") if isinstance(motivos_res, dict) else None
-  areas = (areas_res or {}).get("areas") if isinstance(areas_res, dict) else None
-  context_lines = []
-  if nombre: context_lines.append(f"Paciente: {nombre}")
-  if motivos:
-    context_lines.append("Motivos: " + ", ".join(motivos))
-  elif motivos_msg:
-    context_lines.append("[hint] No hay motivos de consulta registrados en el triage; pide el motivo principal al paciente.")
-  if areas:
-    context_lines.append("Áreas afectadas: " + ", ".join(areas))
-  # Create Encounter
-  encounter_id = None
-  try:
-    from fhir_clini_assistant.fhir_tools import CreateEncounterTool
-    enc_tool = CreateEncounterTool()
-    enc_res = await enc_tool.run_async(args={"patient_id": req.patient_id, "session_id": session_id}, tool_context=None)
-    encounter_id = (enc_res or {}).get("encounter_id")
-    if encounter_id:
-      SESSION_TO_ENCOUNTER[session_id] = encounter_id
-    SESSION_TO_PATIENT[session_id] = req.patient_id
-    logger.info("BOOTSTRAP_LIVE_ENCOUNTER_CREATED id=%s", encounter_id)
-  except Exception as e:
-    logger.warning("BOOTSTRAP_LIVE_ENCOUNTER_FAIL: %s", e)
-  # Build kickoff and send first turn (brief for voice)
-  parts = [
-    types.Part.from_text(text=f"patient:{req.patient_id}"),
-    types.Part.from_text(text=f"session_id={session_id}"),
-  ]
-  if context_lines:
-    parts.append(types.Part.from_text(text=f"[contexto_inicial] {' | '.join(context_lines)}"))
-  if motivos:
-    kickoff_live = (
-      "Iniciemos. Veo motivos registrados. No asumas diagnósticos; en pocas palabras, cuéntame qué te preocupa más ahora mismo."
-    )
-  else:
-    kickoff_live = (
-      "Iniciemos. No tengo motivos registrados en triage. ¿Cuál es tu motivo principal de consulta hoy?"
-    )
-  parts.append(types.Part.from_text(text=kickoff_live))
-  content = types.Content(role="user", parts=parts)
-  logger.info("BOOTSTRAP_LIVE_KICKOFF parts=%d", len(parts))
-  for i, p in enumerate(parts):
-    try:
-      logger.debug("BOOTSTRAP_LIVE_PART[%d]=%s", i, (p.text or "")[:200])
-    except Exception:
-      pass
-  first_reply = None
-  async for event in live_runner.run_async(user_id=req.user_id, session_id=session_id, new_message=content):
-    if event.content and event.content.parts:
-      text = "".join([p.text or "" for p in event.content.parts if p.text])
-      if text:
-        first_reply = text
-  if first_reply:
-    SESSION_TO_TRANSCRIPT.setdefault(session_id, []).append(("agent", first_reply))
-  return {"session_id": session_id, "reply": first_reply, "encounter_id": encounter_id}
-
-
-@app.post("/chat_live")
-async def chat_live(req: ChatRequest):
-  if not live_runner:
-    return JSONResponse({"error": "Live agent not available"}, status_code=503)
-  logger.info("CHAT_LIVE_REQ user_id=%s session_id=%s", req.user_id, req.session_id)
-  logger.info("CHAT_LIVE_AGENT_MODEL %s", getattr(live_agent, "model", None))
-  # Ensure session
-  if req.session_id:
-    session_id = req.session_id
-    just_created = False
-  else:
-    session = await live_runner.session_service.create_session(app_name="clini_assistant_live_api", user_id=req.user_id)
-    session_id = session.id
-    just_created = True
-  # Track user message
-  SESSION_TO_TRANSCRIPT.setdefault(session_id, []).append(("user", req.message or ""))
-  # Build parts
-  parts = [types.Part.from_text(text=req.message or "")]
-  pid = req.patient_id or SESSION_TO_PATIENT.get(session_id)
-  if pid:
-    parts.append(types.Part.from_text(text=f"patient:{pid}"))
-  parts.append(types.Part.from_text(text=f"session_id={session_id}"))
-  content = types.Content(role="user", parts=parts)
-  logger.info("CHAT_LIVE_SEND parts=%d", len(parts))
-  # Run
-  last_text = None
-  async for event in live_runner.run_async(user_id=req.user_id, session_id=session_id, new_message=content):
-    if event.content and event.content.parts:
-      text = "".join([p.text or "" for p in event.content.parts if p.text])
-      if text:
-        last_text = text
-  if last_text:
-    SESSION_TO_TRANSCRIPT.setdefault(session_id, []).append(("agent", last_text))
-  return {"reply": last_text, "session_id": session_id}
-
-
-# ---------- Live Connect (SDK) TTS fallback ----------
-@app.post("/live/tts")
-async def live_tts(req: dict):
-  try:
-    text = (req or {}).get("text") or "Hola, esta es una prueba de voz del agente Live."
-    client = genai.Client()
-    cfg = genai_types.LiveConnectConfig(
-      response_modalities=["AUDIO"],
-      input_audio_transcription=genai_types.AudioTranscriptionConfig(),
-      output_audio_transcription=genai_types.AudioTranscriptionConfig(),
-      proactivity=genai_types.ProactivityConfig(proactive_audio=True),
-    )
-    model_id = os.getenv("LIVE_MODEL", "gemini-live-2.5-flash")
-    audio_chunks: list[bytes] = []
-
-    async with client.aio.live.connect(model=model_id, config=cfg) as session:
-      await session.send_client_content(
-        turns=genai_types.Content(role="user", parts=[genai_types.Part(text=text)])
-      )
-      async for message in session.receive():
-        sc = getattr(message, "server_content", None)
-        if not sc:
-          continue
-        mt = getattr(sc, "model_turn", None)
-        if mt and getattr(mt, "parts", None):
-          for p in mt.parts:
-            if getattr(p, "inline_data", None) and getattr(p.inline_data, "data", None):
-              audio_chunks.append(p.inline_data.data)
-    raw_pcm = b"".join(audio_chunks)
-    if not raw_pcm:
-      return JSONResponse({"error": "no_audio_returned"}, status_code=502)
-    # Wrap PCM 16-bit mono 24kHz into WAV
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-      wf.setnchannels(1)
-      wf.setsampwidth(2)
-      wf.setframerate(24000)
-      wf.writeframes(raw_pcm)
-    return Response(content=buf.getvalue(), media_type="audio/wav")
-  except Exception as e:
-    logger.exception("LIVE_TTS_ERROR: %s", e)
-    return JSONResponse({"error": str(e)}, status_code=500)
-
-# ---------- Live SDK audio<->audio endpoints (WebSocket) ----------
-@app.websocket("/live/ws")
-async def live_ws(websocket: WebSocket):
-  await websocket.accept()
-  # Params for prefetch/bootstrap
-  qp = websocket.query_params or {}
-  user_id = qp.get("user_id") or "u1"
-  patient_id = qp.get("patient_id") or ""
-  # Create a local session id for mapping Encounter/Transcript
-  ws_session_id = str(uuid.uuid4())
-  SESSION_TO_TRANSCRIPT[ws_session_id] = []
-
-  model_id = os.getenv("LIVE_MODEL", "gemini-live-2.5-flash-preview-native-audio")
-  client = genai.Client()
-  cfg = genai_types.LiveConnectConfig(
-    response_modalities=["AUDIO"],
-    input_audio_transcription=genai_types.AudioTranscriptionConfig(),
-    output_audio_transcription=genai_types.AudioTranscriptionConfig(),
-    speech_config=genai_types.SpeechConfig(
-      voice_config=genai_types.VoiceConfig(
-        prebuilt_voice_config=genai_types.PrebuiltVoiceConfig(voice_name="Kore")
-      )
-    ),
-    system_instruction=genai_types.Content(role="system", parts=[genai_types.Part(text=LIVE_SYSTEM_INSTRUCTION)]),
-  )
-  try:
-    async with client.aio.live.connect(model=model_id, config=cfg) as session:
-      # Prefetch (similar to /bootstrap) and Encounter/RiskAssessment
-      kickoff_live = None
-      try:
-        if patient_id:
-          from fhir_clini_assistant.fhir_tools import (
-            GetPatientByIdTool, GetMotivoConsultaTool, GetAreasAfectadasTool,
-            ScoreRiesgoTool, CreateEncounterTool, CreateRiskAssessmentTool,
-          )
-          # Prefetch data
-          patient_tool = GetPatientByIdTool()
-          motivos_tool = GetMotivoConsultaTool()
-          areas_tool = GetAreasAfectadasTool()
-          score_tool = ScoreRiesgoTool()
-          p_task = asyncio.create_task(patient_tool.run_async(args={"patient_id": patient_id}, tool_context=None))
-          m_task = asyncio.create_task(motivos_tool.run_async(args={"patient": patient_id}, tool_context=None))
-          a_task = asyncio.create_task(areas_tool.run_async(args={"patient": patient_id}, tool_context=None))
-          s_task = asyncio.create_task(score_tool.run_async(args={"patient": patient_id}, tool_context=None))
-          patient_res, motivos_res, areas_res, score_res = await asyncio.gather(p_task, m_task, a_task, s_task)
-          nombre = (patient_res or {}).get("nombre") if isinstance(patient_res, dict) else None
-          motivos = (motivos_res or {}).get("motivos") if isinstance(motivos_res, dict) else None
-          motivos_msg = (motivos_res or {}).get("mensaje") if isinstance(motivos_res, dict) else None
-          areas = (areas_res or {}).get("areas") if isinstance(areas_res, dict) else None
-          # Create Encounter
-          try:
-            enc_tool = CreateEncounterTool()
-            enc_res = await enc_tool.run_async(args={"patient_id": patient_id, "session_id": ws_session_id}, tool_context=None)
-            enc_id = (enc_res or {}).get("encounter_id")
-            if enc_id:
-              SESSION_TO_ENCOUNTER[ws_session_id] = enc_id
-            SESSION_TO_PATIENT[ws_session_id] = patient_id
-            logger.info("LIVE_WS_ENCOUNTER_CREATED id=%s", enc_id)
-          except Exception as e:
-            logger.warning("LIVE_WS_ENCOUNTER_FAIL: %s", e)
-          # RiskAssessment (same rationale light)
-          try:
-            outcome_map = {"bajo": "low", "medio": "medium", "alto": "high"}
-            rg = (score_res or {}).get("riesgo_global") or {}
-            outcome_code = outcome_map.get(str(rg.get("categoria", "")).lower(), "low")
-            rationale = ""
-            try:
-              imc = (score_res or {}).get("imc") or {}
-              parts = []
-              if imc.get("valor") is not None:
-                parts.append(f"IMC {imc.get('valor')}")
-              an = (score_res or {}).get("analitos") or {}
-              if (an.get("fpg") or {}).get("valor") is not None:
-                parts.append(f"FPG {an['fpg'].get('valor')}")
-              if (an.get("hba1c") or {}).get("valor") is not None:
-                parts.append(f"HbA1c {an['hba1c'].get('valor')}")
-              rationale = "; ".join(parts) or None
-            except Exception:
-              rationale = None
-            ra_args = {
-              "patient_id": patient_id,
-              "session_id": ws_session_id,
-              "outcome": outcome_code,
-              "rationale": rationale or f"Resultado de riesgo {outcome_code}.",
-              "occurrence_datetime": datetime.now(timezone.utc).isoformat(),
-              "evidence": (score_res or {}).get("evidence"),
-            }
-            ra_res = await CreateRiskAssessmentTool().run_async(args=ra_args, tool_context=None)
-            logger.info("LIVE_WS_RISK_CREATED id=%s", (ra_res or {}).get("risk_assessment_id"))
-          except Exception as e:
-            logger.warning("LIVE_WS_RISK_FAIL: %s", e)
-          # Compose kickoff like text bootstrap
-          lines = []
-          if nombre: lines.append(f"Paciente: {nombre}")
-          if motivos:
-            lines.append("Motivos: " + ", ".join(motivos))
-          elif motivos_msg:
-            lines.append("[hint] No hay motivos de consulta registrados en el triage; pide el motivo principal al paciente.")
-          if areas: lines.append("Áreas afectadas: " + ", ".join(areas))
-          if motivos:
-            kickoff_live = (
-              "Inicia la consulta con saludo empático, menciona nombre, motivos y áreas afectadas disponibles, y formula la primera pregunta abierta para caracterizar el problema principal."
-            )
-          else:
-            kickoff_live = (
-              "Inicia la consulta con saludo empático. No asumas motivos de consulta. Explica brevemente que no hay motivos registrados en triage y pide de forma abierta que te cuente el motivo principal de consulta; luego continúa con preguntas de caracterización."
-            )
-          parts0 = [
-            genai_types.Part(text=f"patient:{patient_id}"),
-            genai_types.Part(text=f"session_id={ws_session_id}"),
-          ]
-          if lines:
-            parts0.append(genai_types.Part(text=f"[contexto_inicial] {' | '.join(lines)}"))
-          if kickoff_live:
-            parts0.append(genai_types.Part(text=kickoff_live))
-          await session.send_client_content(
-            turns=genai_types.Content(role="user", parts=parts0),
-            turn_complete=True,
-          )
-      except Exception as e:
-        logger.warning("LIVE_WS_PREFETCH_FAIL: %s", e)
-
-      async def _sender_from_ws():
-        while True:
-          try:
-            msg = await websocket.receive()
-          except WebSocketDisconnect:
-            break
-          data = msg.get("bytes")
-          text = msg.get("text")
-          try:
-            if data is not None:
-              await session.send_realtime_input(
-                audio=genai_types.Blob(data=data, mime_type="audio/pcm;rate=16000")
-              )
-            elif text:
-              try:
-                j = json.loads(text)
-                if j.get("type") == "text":
-                  t = j.get("text") or ""
-                  await session.send_client_content(
-                    turns=genai_types.Content(role="user", parts=[genai_types.Part(text=t)]),
-                    turn_complete=True,
-                  )
-              except Exception:
-                await session.send_client_content(
-                  turns=genai_types.Content(role="user", parts=[genai_types.Part(text=text)]),
-                  turn_complete=True,
-                )
-          except Exception as e:
-            await websocket.send_text(json.dumps({"event": "error", "message": f"send_error: {e}"}))
-            break
-
-      async def _receiver_to_ws():
-        async for message in session.receive():
-          sc = getattr(message, "server_content", None)
-          if not sc:
-            continue
-          if getattr(sc, "input_transcription", None) and getattr(sc.input_transcription, "text", None):
-            await websocket.send_text(json.dumps({"event": "input_transcription", "text": sc.input_transcription.text}))
-            SESSION_TO_TRANSCRIPT.setdefault(ws_session_id, []).append(("user", sc.input_transcription.text))
-          if getattr(sc, "output_transcription", None) and getattr(sc.output_transcription, "text", None):
-            await websocket.send_text(json.dumps({"event": "output_transcription", "text": sc.output_transcription.text}))
-            SESSION_TO_TRANSCRIPT.setdefault(ws_session_id, []).append(("agent", sc.output_transcription.text))
-          mt = getattr(sc, "model_turn", None)
-          if mt and getattr(mt, "parts", None):
-            for p in mt.parts:
-              if getattr(p, "inline_data", None) and getattr(p.inline_data, "data", None):
-                await websocket.send_bytes(p.inline_data.data)
-
-      send_task = asyncio.create_task(_sender_from_ws())
-      recv_task = asyncio.create_task(_receiver_to_ws())
-      await asyncio.gather(send_task, recv_task)
-  except Exception as e:
-    try:
-      await websocket.send_text(json.dumps({"event": "error", "message": str(e)}))
-    except Exception:
-      pass
-  finally:
-    try:
-      await websocket.close()
-    except Exception:
-      pass
-
-# ---------- Live SDK audio<->audio endpoints ----------
-@app.post("/live/session/start")
-async def live_session_start():
-  sid = str(uuid.uuid4())
-  state = _LiveSessionState(session_id=sid)
-  LIVE_SESSIONS[sid] = state
-  state.worker = asyncio.create_task(_live_worker(state))
-  logger.info("LIVE_SESSION_START id=%s", sid)
-  return {"session_id": sid}
-
-@app.post("/live/session/send-text")
-async def live_session_send_text(payload: dict):
-  sid = (payload or {}).get("session_id")
-  text = (payload or {}).get("text") or ""
-  st = LIVE_SESSIONS.get(sid)
-  if not st:
-    return JSONResponse({"error": "invalid_session"}, status_code=404)
-  await st.in_q.put({"type": "text", "data": text})
-  return {"ok": True}
-
-@app.post("/live/session/send-audio")
-async def live_session_send_audio(request: Request, session_id: str):
-  st = LIVE_SESSIONS.get(session_id)
-  if not st:
-    return JSONResponse({"error": "invalid_session"}, status_code=404)
-  data = await request.body()
-  if not data:
-    return JSONResponse({"error": "empty_body"}, status_code=400)
-  await st.in_q.put({"type": "audio", "data": data, "mime": "audio/pcm;rate=16000"})
-  return {"ok": True}
-
-@app.get("/live/session/receive")
-async def live_session_receive(session_id: str):
-  st = LIVE_SESSIONS.get(session_id)
-  if not st:
-    return JSONResponse({"error": "invalid_session"}, status_code=404)
-
-  async def _gen():
-    try:
-      # Initial hello
-      yield f"data: {json.dumps({'event': 'open'})}\n\n"
-      while True:
-        msg = await st.out_q.get()
-        yield f"data: {json.dumps(msg)}\n\n"
-        if msg.get("event") in ("closed", "error"):
-          break
-    except asyncio.CancelledError:
-      pass
-
-  return StreamingResponse(_gen(), media_type="text/event-stream")
-
-@app.post("/live/session/stop")
-async def live_session_stop(payload: dict):
-  sid = (payload or {}).get("session_id")
-  st = LIVE_SESSIONS.pop(sid, None)
-  if not st:
-    return {"ok": True}
-  try:
-    await st.in_q.put(None)
-    if st.worker and not st.worker.done():
-      st.worker.cancel()
-  except Exception:
-    pass
-  logger.info("LIVE_SESSION_STOP id=%s", sid)
-  return {"ok": True}
+  return {"reply": cleaned_reply or ""}
 
 @app.get("/healthz")
 async def healthz():

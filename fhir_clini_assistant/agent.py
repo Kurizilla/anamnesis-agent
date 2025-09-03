@@ -122,7 +122,7 @@ Detalles de implementación (parámetros):
 )
 
 root_agent = Agent(
-    model='gemini-2.0-flash',
+    model='gemini-2.5-flash',
     name='clini_assistant',
     description='Agente de consulta clínica cara al paciente con acceso a FHIR.',
     instruction=_INSTRUCTION,

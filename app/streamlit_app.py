@@ -15,20 +15,16 @@ with st.sidebar:
   public_backend_url = st.text_input("Backend URL (para navegador)", PUBLIC_BACKEND_URL)
   st.caption("Usado por el navegador para WebRTC (no puede usar hostnames internos del cluster como clini_api)")
 
-# Tabs for Text (Anamnesis, Riesgo) and Voice
 anam_tab, risk_tab, voice_tab = st.tabs(["Texto: Anamnesis", "Texto: Riesgo", "Voz (Live)"])
 
-# ---------- Texto: Anamnesis ----------
 with anam_tab:
-  # Estado de sesión independiente
   if "anam_session_id" not in st.session_state:
     st.session_state.anam_session_id = ""
   if "anam_history" not in st.session_state:
-    st.session_state.anam_history = []  # lista de (role, text)
+    st.session_state.anam_history = []
 
   st.text_input("User ID", key="anam_user_id", value="u1")
-  patient_help = "Se usa en el primer turno para iniciar la sesión, precargar motivos y áreas afectadas."
-  st.text_input("Patient ID (primer turno)", key="anam_patient_id", help=patient_help, disabled=bool(st.session_state.anam_session_id))
+  st.text_input("Patient ID (primer turno)", key="anam_patient_id", help="Se usa en el primer turno para iniciar la sesión, precargar motivos y áreas afectadas.", disabled=bool(st.session_state.anam_session_id))
 
   c1, c2 = st.columns(2)
 
@@ -62,8 +58,7 @@ with anam_tab:
   st.markdown("---")
 
   with st.form("chat_form_anam", clear_on_submit=True):
-    msg = st.text_area("Mensaje", key="anam_message", height=120, placeholder="Escribe tu mensaje…",
-                       disabled=not bool(st.session_state.anam_session_id))
+    msg = st.text_area("Mensaje", key="anam_message", height=120, placeholder="Escribe tu mensaje…", disabled=not bool(st.session_state.anam_session_id))
     col1, col2 = st.columns(2)
     submit = col1.form_submit_button("Enviar", type="primary", disabled=not bool(st.session_state.anam_session_id))
     reset = col2.form_submit_button("Reiniciar sesión")
@@ -97,10 +92,10 @@ with anam_tab:
     st.session_state.anam_history.append(("system", "[Sesión reiniciada]"))
 
   st.markdown("""
-<small>
-Flujo: 1) Ingresa Patient ID y pulsa “Entrar a la consulta” (se hará prefetch y saludo inicial). 2) Continúa chateando.
-</small>
-""", unsafe_allow_html=True)
+  <small>
+  Flujo: 1) Ingresa Patient ID y pulsa “Entrar a la consulta” (se hará prefetch y saludo inicial). 2) Continúa chateando.
+  </small>
+  """, unsafe_allow_html=True)
 
   st.markdown("---")
   st.subheader("Conversación (Anamnesis)")
@@ -118,7 +113,6 @@ Flujo: 1) Ingresa Patient ID y pulsa “Entrar a la consulta” (se hará prefet
   if st.session_state.anam_session_id:
     st.caption(f"Session ID actual: {st.session_state.anam_session_id}")
 
-# ---------- Texto: Riesgo ----------
 with risk_tab:
   if "risk_session_id" not in st.session_state:
     st.session_state.risk_session_id = ""
@@ -139,13 +133,13 @@ with risk_tab:
     try:
       with st.spinner("Estás entrando a tu consulta (Riesgo)…"):
         resp = requests.post(f"{backend_url}/bootstrap", json={"user_id": user_id, "patient_id": patient_id, "agent_kind": "risk"}, timeout=180)
-        if resp.status_code != 200:
-          st.error(f"Error {resp.status_code}: {resp.text}")
-          return
-        data = resp.json()
-        st.session_state.risk_session_id = data.get("session_id", "")
-        first_reply = data.get("reply") or "(sin respuesta)"
-        st.session_state.risk_history.append(("agent", first_reply))
+      if resp.status_code != 200:
+        st.error(f"Error {resp.status_code}: {resp.text}")
+        return
+      data = resp.json()
+      st.session_state.risk_session_id = data.get("session_id", "")
+      first_reply = data.get("reply") or "(sin respuesta)"
+      st.session_state.risk_history.append(("agent", first_reply))
     except Exception as e:
       st.error(f"Error de red: {e}")
 
@@ -155,13 +149,12 @@ with risk_tab:
   with c4:
     if st.button("Reiniciar sesión (Riesgo)"):
       st.session_state.risk_session_id = ""
-      st.session_state.risk_history.append(("system", "[Sesión reiniciada]"))
+      st.session_state.risk_history.append(("system", "[Sesión reiniciada]") )
 
   st.markdown("---")
 
   with st.form("chat_form_risk", clear_on_submit=True):
-    msg = st.text_area("Mensaje", key="risk_message", height=120, placeholder="Escribe tu mensaje…",
-                       disabled=not bool(st.session_state.risk_session_id))
+    msg = st.text_area("Mensaje", key="risk_message", height=120, placeholder="Escribe tu mensaje…", disabled=not bool(st.session_state.risk_session_id))
     col1, col2 = st.columns(2)
     submit = col1.form_submit_button("Enviar", type="primary", disabled=not bool(st.session_state.risk_session_id))
     reset = col2.form_submit_button("Reiniciar sesión")
@@ -207,6 +200,5 @@ with risk_tab:
       else:
         st.markdown(f"`{role}` {text}")
 
-# ---------- Voz (Live) ----------
 with voice_tab:
   st.write("Preview de agente de voz. (La UI de streaming se está integrando por etapas.)") 

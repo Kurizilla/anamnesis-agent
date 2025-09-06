@@ -1306,6 +1306,7 @@ class ScoreRiesgoTool(BaseTool):
     if not patient:
       raise ValueError("Parámetro requerido: patient")
     logger.debug("score_riesgo.run: patient=%s", patient)
+    logger.info("RISK_SCORE_START patient=%s", patient)
 
     # IMC
     imc_obs = await self._fetch_latest_observation_by_code(patient, "IMC")
@@ -1939,6 +1940,12 @@ class ScoreRiesgoTool(BaseTool):
         },
       },
     }
+    try:
+      pct = (result.get("riesgo_global", {}).get("puntos", {}) or {}).get("porcentaje")
+      cat = (result.get("riesgo_global", {}) or {}).get("categoria")
+      logger.info("RISK_SCORE_RESULT patient=%s pct=%s cat=%s", patient, pct, cat)
+    except Exception:
+      pass
     return result 
 
 
@@ -2221,10 +2228,13 @@ class CreateRiskAssessmentTool(BaseTool):
       raise ValueError('Parámetro requerido: outcome')
 
     self._ensure()
+    logger.info("RISK_RA_START patient=%s outcome=%s encounter_id=%s session_id=%s", patient_id, outcome, encounter_id, session_id)
 
     # Resolver Encounter si es necesario
     if not encounter_id and session_id:
       encounter_id = self._resolve_encounter_id_by_session(session_id)
+      if encounter_id:
+        logger.info("RISK_RA_ENCOUNTER_RESOLVED session_id=%s encounter_id=%s", session_id, encounter_id)
 
     basis_refs = []
     # Evidence: preferir evidencia explícita si se pasa; si no, resolver automáticamente
@@ -2247,6 +2257,10 @@ class CreateRiskAssessmentTool(BaseTool):
         prob_decimal = round(max(0.0, min(1.0, present / float(total))), 2)
       except Exception:
         prob_decimal = None
+      try:
+        logger.info("RISK_RA_EVIDENCE_COVERAGE patient=%s present=%s total=%s prob=%s (explicit)", patient_id, present, total, prob_decimal)
+      except Exception:
+        pass
       for oid in [obs_map.get('imc'), obs_map.get('fpg'), obs_map.get('hba1c') or obs_map.get('a1c'), obs_map.get('trigliceridos') or obs_map.get('trig'), obs_map.get('hdl')]:
         if oid:
           basis_refs.append({"reference": f"Observation/{oid}"})
@@ -2269,6 +2283,10 @@ class CreateRiskAssessmentTool(BaseTool):
         prob_decimal = round(max(0.0, min(1.0, present / float(total))), 2)
       except Exception:
         prob_decimal = None
+      try:
+        logger.info("RISK_RA_EVIDENCE_COVERAGE patient=%s present=%s total=%s prob=%s (auto)", patient_id, present, total, prob_decimal)
+      except Exception:
+        pass
       for key in ["imc", "fpg", "a1c", "trig", "hdl"]:
         oid = obs_ids.get(key)
         if oid:
@@ -2302,16 +2320,25 @@ class CreateRiskAssessmentTool(BaseTool):
       body["encounter"] = {"reference": f"Encounter/{encounter_id}"}
     if basis_refs:
       body["basis"] = basis_refs
+    try:
+      logger.info("RISK_RA_POST patient=%s outcome=%s prob=%s encounter=%s basis_refs=%d", patient_id, outcome, prob_decimal, encounter_id, len(basis_refs))
+    except Exception:
+      pass
 
     headers = {"Content-Type": "application/fhir+json;charset=utf-8"}
     resp = self._session.post(f"{self._base_url}/RiskAssessment", headers=headers, json=body)
     if resp.status_code not in (200, 201):
+      logger.warning("RISK_RA_FAIL status=%s body=%s", getattr(resp, 'status_code', None), getattr(resp, 'text', ''))
       raise types.FunctionCallError(
         code="FAILED_PRECONDITION",
         message=f"No se pudo crear RiskAssessment (status {resp.status_code}): {resp.text}",
       )
 
     res = resp.json() if resp.content else {}
+    try:
+      logger.info("RISK_RA_OK id=%s outcome=%s prob=%s", res.get('id'), outcome, prob_decimal)
+    except Exception:
+      pass
     return {
       "risk_assessment_id": res.get('id'),
       "outcome": outcome,
@@ -2711,3 +2738,451 @@ except NameError:
 
       snap = get_checklist_snapshot(session_id)
       return {"area": data.get("area") if data else None, "updated": updated, "counts": snap.get("counts")}
+
+# ====== Risk checklist (in-memory, excludes analytes) ======
+try:
+	_RISK_CHECKLISTS  # type: ignore
+except NameError:
+	_RISK_CHECKLISTS = {}
+
+try:
+	get_risk_checklist_snapshot  # type: ignore
+except NameError:
+	def get_risk_checklist_snapshot(session_id: str) -> dict:
+		data = _RISK_CHECKLISTS.get(session_id)
+		if not data:
+			try:
+				import logging
+				logging.getLogger(__name__).info("RISK_CHECKLIST_SNAPSHOT session_id=%s exists=False", session_id)
+			except Exception:
+				pass
+			return {"exists": False, "counts": {"pending": 0, "asked": 0, "answered": 0, "total": 0}, "pending_items": [], "answered_items": []}
+		items = data.get("items") or []
+		counts = {"pending": 0, "asked": 0, "answered": 0, "total": len(items)}
+		pending_names = []
+		answered_names = []
+		for it in items:
+			st = (it.get("status") or "pending").lower()
+			name = it.get("name")
+			if st == "answered":
+				counts["answered"] += 1
+				if name: answered_names.append(name)
+			elif st == "asked":
+				counts["asked"] += 1
+			else:
+				counts["pending"] += 1
+				if name: pending_names.append(name)
+		try:
+			import logging
+			logging.getLogger(__name__).info(
+				"RISK_CHECKLIST_SNAPSHOT session_id=%s exists=True counts=%s pending=%s answered=%s",
+				session_id,
+				counts,
+				", ".join(pending_names)[:200],
+				", ".join(answered_names)[:200],
+			)
+		except Exception:
+			pass
+		return {"exists": True, "counts": counts, "pending_items": pending_names, "answered_items": answered_names}
+
+class GetRiskChecklistTool(BaseTool):
+	"""Crea/lee el checklist de factores de riesgo que el paciente puede aportar.
+
+	Variables incluidas (no analitos):
+	- altura_peso_para_imc (altura, peso)
+	- cintura_cm
+	- fumar_actual
+	- antecedentes_familiares_dm2_hta
+	- sexo
+	- edad
+	"""
+
+	def __init__(self):
+		super().__init__(
+			name="get_risk_checklist",
+			description="Crea/lee el checklist de factores de riesgo (excluye analitos) para la sesión.",
+		)
+
+	async def run_async(self, *, args: dict[str, Any], tool_context: ToolContext) -> Any:
+		session_id = (args.get("session_id") or "").strip()
+		if not session_id:
+			raise ValueError("session_id requerido")
+		existing = _RISK_CHECKLISTS.get(session_id)
+		if existing:
+			items = existing.get("items") or []
+			completed = sum(1 for it in items if (it.get("status") or "pending").lower() == "answered")
+			try:
+				import logging
+				logging.getLogger(__name__).info("RISK_CHECKLIST_REUSE session_id=%s total=%d completed=%d", session_id, len(items), completed)
+			except Exception:
+				pass
+			return {"items": items, "completed": completed, "total": len(items)}
+		# Initialize default risk items
+		default_items = [
+			{"name": "altura_peso_para_imc", "status": "pending", "value": None},
+			{"name": "cintura_cm", "status": "pending", "value": None},
+			{"name": "fumar_actual", "status": "pending", "value": None},
+			{"name": "antecedentes_familiares_dm2_hta", "status": "pending", "value": None},
+			{"name": "sexo", "status": "pending", "value": None},
+			{"name": "edad", "status": "pending", "value": None},
+		]
+		_RISK_CHECKLISTS[session_id] = {"items": default_items}
+		try:
+			import logging
+			logging.getLogger(__name__).info("RISK_CHECKLIST_INIT session_id=%s items=%s", session_id, ", ".join([i.get("name") for i in default_items]))
+		except Exception:
+			pass
+		return {"items": default_items, "completed": 0, "total": len(default_items)}
+
+class UpdateRiskItemTool(BaseTool):
+	"""Actualiza el estado/valor de un ítem del checklist de riesgo de la sesión."""
+
+	def __init__(self):
+		super().__init__(
+			name="update_risk_item",
+			description="Marca un ítem del checklist de riesgo como asked/answered y guarda valor si aplica.",
+		)
+
+	async def run_async(self, *, args: dict[str, Any], tool_context: ToolContext) -> Any:
+		session_id = (args.get("session_id") or "").strip()
+		item = (args.get("item") or "").strip()
+		status = (args.get("status") or "").strip().lower()
+		value = args.get("value")
+		if not session_id or not item or status not in {"pending", "asked", "answered"}:
+			raise types.FunctionCallError(code="INVALID_ARGUMENT", message="session_id, item y status válidos son requeridos")
+		data = _RISK_CHECKLISTS.get(session_id)
+		if not data:
+			init = GetRiskChecklistTool()
+			await init.run_async(args={"session_id": session_id}, tool_context=None)  # type: ignore
+			data = _RISK_CHECKLISTS.get(session_id)
+		items = data.get("items") if data else []
+		before = get_risk_checklist_snapshot(session_id)
+		updated = False
+		low = item.lower()
+		for it in items:
+			if str(it.get("name") or "").lower() == low:
+				it["status"] = status
+				if value is not None:
+					it["value"] = value
+				updated = True
+				break
+		after = get_risk_checklist_snapshot(session_id)
+		try:
+			import logging
+			logging.getLogger(__name__).info(
+				"RISK_CHECKLIST_UPDATE session_id=%s item=%s status=%s value=%s updated=%s before=%s after=%s",
+				session_id,
+				item,
+				status,
+				(value if value is not None else ""),
+				updated,
+				(before.get("counts") if isinstance(before, dict) else None),
+				(after.get("counts") if isinstance(after, dict) else None),
+			)
+		except Exception:
+			pass
+		return after
+
+class CreateImcObservationTool(BaseTool):
+  """Crea una Observation de IMC (Índice de masa corporal) con estructura estándar.
+
+  Args:
+    patient_id (str): ID del paciente
+    encounter_id (str, opcional): Encounter a relacionar
+    value_bmi (float): valor numérico del IMC
+    effective_datetime (str, opcional): ISO8601; por defecto ahora en UTC
+
+  Comportamiento:
+    - Publica Observation con:
+      - category=vital-signs
+      - code coding IMC (system=http://goes.gob.sv)
+      - component code LOINC 39156-5 y valueString "{value:.6f} kg/m2"
+      - valueQuantity con unit/kg/m2 y valor decimal con 2 decimales
+      - encounter.display="Risk-agent"
+      - performer como el propio Patient (display nombre)
+  """
+
+  def __init__(self):
+    super().__init__(
+      name="create_imc_observation",
+      description="Crea una Observation de IMC vinculada a Patient y Encounter.",
+    )
+    self._session: Optional[AuthorizedSession] = None
+    self._base_url: Optional[str] = None
+
+  def _ensure(self):
+    if not self._session:
+      self._session = _new_authorized_session()
+    if not self._base_url:
+      self._base_url = _build_fhir_store_base_url()
+
+  async def run_async(self, *, args: dict[str, Any], tool_context: ToolContext) -> Any:
+    patient_id: str = args.get('patient_id') or ''
+    if not patient_id:
+      raise ValueError('Parámetro requerido: patient_id')
+    pid = str(patient_id).replace('Patient/', '')
+    encounter_id: Optional[str] = args.get('encounter_id')
+    value_bmi_raw = args.get('value_bmi')
+    if value_bmi_raw is None:
+      raise ValueError('Parámetro requerido: value_bmi')
+    try:
+      value_bmi = float(value_bmi_raw)
+    except Exception:
+      raise ValueError('value_bmi debe ser numérico')
+    effective_dt: str = args.get('effective_datetime') or (datetime.utcnow().isoformat() + 'Z')
+
+    self._ensure()
+
+    # Obtener nombre de paciente para displays
+    display_name = None
+    try:
+      ptool = GetPatientByIdTool()
+      pres = await ptool.run_async(args={"patient_id": pid}, tool_context=None)
+      display_name = (pres or {}).get('nombre')
+    except Exception:
+      display_name = None
+
+    body = {
+      "resourceType": "Observation",
+      "status": "final",
+      "category": [
+        {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+              "code": "vital-signs",
+              "display": "Vital Signs",
+            }
+          ]
+        }
+      ],
+      "code": {
+        "coding": [
+          {
+            "system": "http://goes.gob.sv",
+            "code": "IMC",
+            "display": "Índice de masa corporal",
+          }
+        ]
+      },
+      "component": [
+        {
+          "code": {
+            "coding": [
+              {
+                "system": "http://loinc.org/",
+                "code": "39156-5",
+                "display": "Índice de masa corporal",
+              }
+            ],
+            "text": "IMC",
+          },
+          "valueString": f"{value_bmi:.6f} kg/m2",
+        }
+      ],
+      "effectiveDateTime": effective_dt,
+      "subject": {
+        "reference": f"Patient/{pid}",
+      },
+      "valueQuantity": {
+        "system": "http://unitsofmeasure.org/",
+        "code": "kg/m2",
+        "unit": "kg/m2",
+        "value": round(value_bmi, 2),
+      },
+    }
+    if display_name:
+      body["subject"]["display"] = display_name
+    if encounter_id:
+      body["encounter"] = {"reference": f"Encounter/{encounter_id}", "display": "Risk-agent"}
+    # performer: Patient self
+    perf = {"reference": f"Patient/{pid}"}
+    if display_name:
+      perf["display"] = display_name
+    body["performer"] = [perf]
+
+    try:
+      logger.info("IMC_OBS_POST patient=%s encounter=%s value_bmi=%s", pid, encounter_id, value_bmi)
+    except Exception:
+      pass
+
+    headers = {"Content-Type": "application/fhir+json;charset=utf-8"}
+    resp = self._session.post(f"{self._base_url}/Observation", headers=headers, json=body)
+    if resp.status_code not in (200, 201):
+      logger.warning("IMC_OBS_FAIL status=%s body=%s", getattr(resp, 'status_code', None), getattr(resp, 'text', ''))
+      raise types.FunctionCallError(
+        code="FAILED_PRECONDITION",
+        message=f"No se pudo crear IMC Observation (status {resp.status_code}): {resp.text}",
+      )
+    res = resp.json() if resp.content else {}
+    try:
+      logger.info("IMC_OBS_OK id=%s value_bmi=%s", res.get('id'), value_bmi)
+    except Exception:
+      pass
+    return {"observation_id": res.get('id')}
+
+class UpsertPreventionQuestionnaireResponseTool(BaseTool):
+  """Crea o actualiza un QuestionnaireResponse para Variables prevención (10001)
+  actualizando/insertando preguntas de interés:
+    - 10009: ¿Cuánto mide de cintura en centímetros? => valueInteger
+    - 10012: ¿Fuma? => valueBoolean
+
+  Args:
+    patient_id (str): ID del paciente
+    encounter_id (str, opcional)
+    session_id (str, opcional) para resolver encounter si falta
+    cintura_cm (int, opcional)
+    fuma_actual (bool, opcional)
+    authored (str, opcional) ISO8601
+
+  Comportamiento:
+    - Busca el último QR por subject=Patient/{id}; si hay con identifier.system=https://www.tca.com lo prefiere
+    - Mezcla/crea la sección linkId=10001 y sus ítems 10009/10012
+    - author/source se setean al Patient; encounter.display="Risk-agent"; status="completed"
+    - Si existe id, hace PUT a /QuestionnaireResponse/{id}; si no, POST
+  """
+
+  def __init__(self):
+    super().__init__(
+      name="upsert_prevention_questionnaire_response",
+      description="Upsert QuestionnaireResponse de Variables prevención (10001: 10009/10012).",
+    )
+    self._session: Optional[AuthorizedSession] = None
+    self._base_url: Optional[str] = None
+
+  def _ensure(self):
+    if not self._session:
+      self._session = _new_authorized_session()
+    if not self._base_url:
+      self._base_url = _build_fhir_store_base_url()
+
+  def _prefer_provider_qr(self, entries: list[dict]) -> Optional[dict]:
+    """Devuelve el recurso preferido (provider system primero, por lastUpdated)."""
+    def _parse_dt_str(d: str) -> float:
+      try:
+        if d.endswith('Z'):
+          d = d.replace('Z', '+00:00')
+        return datetime.fromisoformat(d).timestamp()
+      except Exception:
+        return 0.0
+    resources = [((e or {}).get('resource', {}) or {}) for e in (entries or [])]
+    def _has_system(r: dict) -> bool:
+      ident = r.get('identifier')
+      if isinstance(ident, dict):
+        return ident.get('system') == 'https://www.tca.com'
+      if isinstance(ident, list):
+        return any((it or {}).get('system') == 'https://www.tca.com' for it in ident)
+      return False
+    preferred = [r for r in resources if _has_system(r)]
+    others = [r for r in resources if not _has_system(r)]
+    preferred.sort(key=lambda r: _parse_dt_str(((r.get('meta', {}) or {}).get('lastUpdated') or r.get('authored') or '')), reverse=True)
+    others.sort(key=lambda r: _parse_dt_str(((r.get('meta', {}) or {}).get('lastUpdated') or r.get('authored') or '')), reverse=True)
+    return (preferred + others)[0] if (preferred or others) else None
+
+  def _upsert_section_items(self, qr: dict, cintura_cm: Optional[int], fuma_actual: Optional[bool]):
+    # Ensure top-level item list
+    items = qr.setdefault('item', [])
+    # Find or create section 10001
+    sec = None
+    for it in items:
+      if str(it.get('linkId')) == '10001':
+        sec = it
+        break
+    if sec is None:
+      sec = {'linkId': '10001', 'text': 'Variables prevención', 'item': []}
+      items.append(sec)
+    subitems = sec.setdefault('item', [])
+    # Helper to set/replace subitem
+    def set_sub(link_id: str, text: str, answer: dict):
+      for sit in subitems:
+        if str(sit.get('linkId')) == link_id:
+          sit['text'] = text
+          sit['answer'] = [answer]
+          return
+      subitems.append({'linkId': link_id, 'text': text, 'answer': [answer]})
+    if isinstance(cintura_cm, int):
+      set_sub('10009', '¿Cuánto mide de cintura en centímetros?', {'valueInteger': int(cintura_cm)})
+    if isinstance(fuma_actual, bool):
+      set_sub('10012', '¿Fuma?', {'valueBoolean': bool(fuma_actual)})
+
+  async def run_async(self, *, args: dict[str, Any], tool_context: ToolContext) -> Any:
+    patient_id: str = args.get('patient_id') or ''
+    if not patient_id:
+      raise ValueError('Parámetro requerido: patient_id')
+    pid = str(patient_id).replace('Patient/', '')
+    encounter_id: Optional[str] = args.get('encounter_id')
+    session_id: Optional[str] = args.get('session_id')
+    cintura_cm = args.get('cintura_cm')
+    fuma_actual = args.get('fuma_actual')
+    authored = args.get('authored') or (datetime.utcnow().isoformat() + 'Z')
+
+    self._ensure()
+
+    # Resolve encounter by session if missing
+    if not encounter_id and session_id:
+      try:
+        r = self._session.get(
+          f"{self._base_url}/Encounter",
+          params={"identifier": "http://goes.gob.sv/fhir/identifiers/session|" + session_id},
+          headers={"Content-Type": "application/fhir+json;charset=utf-8"},
+        )
+        if getattr(r, 'status_code', None) == 200:
+          entries = (r.json() or {}).get('entry', [])
+          if entries:
+            encounter_id = (((entries[0] or {}).get('resource', {}) or {}).get('id'))
+      except Exception:
+        pass
+
+    # Fetch latest QR by subject
+    existing_qr = None
+    try:
+      resp = self._session.get(
+        f"{self._base_url}/QuestionnaireResponse",
+        params={"subject": f"Patient/{pid}"},
+        headers={"Content-Type": "application/fhir+json;charset=utf-8"},
+      )
+      if getattr(resp, 'status_code', None) == 200:
+        entries = (resp.json() or {}).get('entry', [])
+        existing_qr = self._prefer_provider_qr(entries)
+    except Exception:
+      existing_qr = None
+
+    # Build resource
+    if existing_qr:
+      qr_res = json.loads(json.dumps(existing_qr))  # deep copy
+      qr_id = qr_res.get('id')
+      logger.info("RISK_QR_UPSERT_FOUND id=%s", qr_id)
+    else:
+      qr_res = {"resourceType": "QuestionnaireResponse"}
+      qr_id = None
+      # Create default identifier consistent with provider system
+      qr_res['identifier'] = {"system": "https://www.tca.com", "value": f"RISK|{pid}|{datetime.utcnow().isoformat()}"}
+
+    qr_res['subject'] = {"reference": f"Patient/{pid}"}
+    qr_res['status'] = 'completed'
+    qr_res['authored'] = authored
+    # author/source as Patient
+    qr_res['author'] = {"reference": f"Patient/{pid}"}
+    qr_res['source'] = {"reference": f"Patient/{pid}"}
+    if encounter_id:
+      qr_res['encounter'] = {"reference": f"Encounter/{encounter_id}", "display": "Risk-agent"}
+    # Upsert items
+    self._upsert_section_items(qr_res, (int(cintura_cm) if isinstance(cintura_cm, (int, float, str)) and str(cintura_cm).strip().isdigit() else None), (bool(fuma_actual) if isinstance(fuma_actual, bool) else None))
+
+    # Send
+    headers = {"Content-Type": "application/fhir+json;charset=utf-8"}
+    if qr_id:
+      logger.info("RISK_QR_PUT id=%s", qr_id)
+      resp2 = self._session.put(f"{self._base_url}/QuestionnaireResponse/{qr_id}", headers=headers, json=qr_res)
+    else:
+      logger.info("RISK_QR_POST new resource")
+      resp2 = self._session.post(f"{self._base_url}/QuestionnaireResponse", headers=headers, json=qr_res)
+    if getattr(resp2, 'status_code', None) not in (200, 201):
+      logger.warning("RISK_QR_FAIL status=%s body=%s", getattr(resp2, 'status_code', None), getattr(resp2, 'text', ''))
+      raise types.FunctionCallError(code="FAILED_PRECONDITION", message=f"QR upsert failed ({resp2.status_code}): {resp2.text}")
+    res = resp2.json() if resp2.content else {}
+    try:
+      logger.info("RISK_QR_OK id=%s updated_items=%s", res.get('id'), ["10009" if cintura_cm is not None else None, "10012" if fuma_actual is not None else None])
+    except Exception:
+      pass
+    return {"questionnaire_response_id": res.get('id')}

@@ -36,17 +36,19 @@ async def create_encounter(patient_id: str, session_id: str, purpose: Optional[s
   return (res or {}).get("encounter_id")
 
 
-def build_context_lines(patient_res: Optional[dict], motivos_res: Optional[dict], areas_res: Optional[dict], score_res: Optional[dict] = None) -> List[str]:
+def build_context_lines(patient_res: Optional[dict], motivos_res: Optional[dict], areas_res: Optional[dict], score_res: Optional[dict] = None, *, agent_kind: Optional[str] = None) -> List[str]:
   nombre = (patient_res or {}).get("nombre") if isinstance(patient_res, dict) else None
   motivos = (motivos_res or {}).get("motivos") if isinstance(motivos_res, dict) else None
   motivos_msg = (motivos_res or {}).get("mensaje") if isinstance(motivos_res, dict) else None
   areas = (areas_res or {}).get("areas") if isinstance(areas_res, dict) else None
   lines: List[str] = []
   if nombre: lines.append(f"Paciente: {nombre}")
-  if motivos:
-    lines.append("Motivos: " + ", ".join(motivos))
-  elif motivos_msg:
-    lines.append("[hint] No hay motivos de consulta registrados en el triage; pide el motivo principal al paciente.")
+  # For risk agent, avoid motive guidance entirely
+  if (agent_kind or "").strip().lower() != "risk":
+    if motivos:
+      lines.append("Motivos: " + ", ".join(motivos))
+    elif motivos_msg:
+      lines.append("[hint] No hay motivos de consulta registrados en el triage; pide el motivo principal al paciente.")
   if areas:
     lines.append("Áreas afectadas: " + ", ".join(areas))
   return lines

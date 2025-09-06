@@ -30,6 +30,7 @@ def strip_tool_calls(text: str) -> str:
   i = 0
   while i < len(lines):
     ln = lines[i]
+    # Remove YAML tool sections
     m = re.match(r"\s*(?:tools\.)?(create_clinical_impression|update_encounter_status)\s*:\s*$", ln, flags=re.IGNORECASE)
     if m:
       removed_yaml += 1
@@ -42,6 +43,10 @@ def strip_tool_calls(text: str) -> str:
           i += 1
           continue
         break
+      continue
+    # Remove Spanish tool/log lines
+    if re.match(r"\s*(Llamando a la herramienta|Output de la herramienta)\b", ln, flags=re.IGNORECASE):
+      i += 1
       continue
     out_lines.append(ln)
     i += 1
